@@ -1,7 +1,6 @@
 # uefn-python-tools
 
-A growing collection of Python tools for UEFN. More will be added over time — for now it
-holds the **Verse Field Tool**.
+A growing collection of Python tools for UEFN. More will be added over time.
 
 ## Verse Field Tool
 
