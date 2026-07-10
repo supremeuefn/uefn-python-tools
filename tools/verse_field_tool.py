@@ -457,8 +457,12 @@ if not _needs_restart:
         task.replace_identical = True
         task.prompt = False
         unreal.Exporter.run_asset_export_task(task)
-        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-            text = handle.read()
+        with open(path, "rb") as handle:
+            raw_bytes = handle.read()
+        if raw_bytes.startswith(b'\xff\xfe') or b'\x00' in raw_bytes[:100]:
+            text = raw_bytes.decode('utf-16le', errors='ignore')
+        else:
+            text = raw_bytes.decode('utf-8', errors='ignore')
         try:
             os.remove(path)
         except OSError:
