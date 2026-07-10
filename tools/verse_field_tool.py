@@ -123,8 +123,8 @@ if not _needs_restart:
         QHeaderView, QTextEdit, QSplitter, QComboBox, QAbstractItemView,
         QGroupBox, QTabWidget, QSpinBox, QMessageBox, QAbstractSpinBox,
     )
-    from PySide6.QtCore import Qt, QPointF
-    from PySide6.QtGui import QColor, QPainter, QPen
+    from PySide6.QtCore import Qt, QPointF, QRectF
+    from PySide6.QtGui import QColor, QPainter, QPen, QFont
 
     # ═══════════════════════════════════════════════════════════════════════
     #  STYLE  (UE5 Slate palette)
@@ -275,6 +275,80 @@ if not _needs_restart:
                             QPointF(cx, cy + 2),
                             QPointF(cx + 4, cy - 2)])
             p.end()
+
+    # Sort states for SortHeader, cycled in this order.
+    SORT_NONE, SORT_ASC, SORT_DESC = 0, 1, 2
+
+    class SortHeader(QHeaderView):
+        """Header that PAINTS a 3-state sort indicator on one column.
+
+        Clicking the column cycles neutral -> A-Z -> Z-A -> neutral and invokes
+        `on_change(state)`, which must re-sort the table's BACKING LIST. Qt's own
+        setSortingEnabled() only reorders the view, which would desync the
+        row->field mapping that binding and deletion rely on.
+
+        Like ArrowCombo, the glyph is painted rather than styled: this Qt build
+        does not render CSS/image arrows on header subcontrols.
+        """
+        def __init__(self, column, on_change, parent=None):
+            super().__init__(Qt.Orientation.Horizontal, parent)
+            self._column = column
+            self._on_change = on_change
+            self.state = SORT_NONE
+            self.setSectionsClickable(True)
+            self.sectionClicked.connect(self._clicked)
+
+        def _clicked(self, index):
+            if index != self._column:
+                return
+            self.state = (self.state + 1) % 3
+            self._on_change(self.state)
+            self.viewport().update()
+
+        def reset_state(self):
+            """Return to neutral without firing the callback (e.g. on reload)."""
+            self.state = SORT_NONE
+            self.viewport().update()
+
+        def paintSection(self, painter, rect, index):
+            super().paintSection(painter, rect, index)
+            if index != self._column:
+                return
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            active = self.state != SORT_NONE
+            color = QColor(C_ACC if active else C_TX2)
+            # Classic A-over-Z sort glyph + a direction arrow, pinned to the far
+            # right of the section. Z-A flips the letters to Z-over-A. Painted
+            # (not styled) so it renders on this Qt build.
+            arrow_x = rect.right() - 11
+            letters_cx = arrow_x - 11
+            cy = rect.center().y()
+
+            # Stacked letters
+            top, bot = ("Z", "A") if self.state == SORT_DESC else ("A", "Z")
+            f = QFont(self.font())
+            f.setPixelSize(9)
+            f.setBold(True)
+            painter.setFont(f)
+            painter.setPen(color)
+            painter.drawText(QRectF(letters_cx - 6, cy - 10, 12, 10),
+                             Qt.AlignmentFlag.AlignCenter, top)
+            painter.drawText(QRectF(letters_cx - 6, cy, 12, 10),
+                             Qt.AlignmentFlag.AlignCenter, bot)
+
+            # Down arrow (shaft + head) beside the letters
+            pen = QPen(color)
+            pen.setWidthF(1.4)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(arrow_x, cy - 6), QPointF(arrow_x, cy + 6))
+            painter.drawPolyline([QPointF(arrow_x - 3, cy + 2),
+                                  QPointF(arrow_x, cy + 6),
+                                  QPointF(arrow_x + 3, cy + 2)])
+            painter.restore()
 
     # ═══════════════════════════════════════════════════════════════════════
     #  LOGIC  (no UI — every call verified against a live widget)
@@ -1245,7 +1319,8 @@ if not _needs_restart:
             self.resize(1080, 780)
             self._wbp_path = None
             self._fields = []
-            self._visible_fields = []   # _fields after the category filter
+            self._visible_fields = []   # _fields after the category filter + sort
+            self._manage_rows = []      # _fields after the Manage tab's sort
             self._widgets = []
             self._child_widgets = []
             self._target_rows = []
@@ -1308,6 +1383,8 @@ if not _needs_restart:
             self.tbl_fields = QTableWidget(0, 3)
             self.tbl_fields.setHorizontalHeaderLabels(["Field", "Type", "Category"])
             self._setup_table(self.tbl_fields, multi=True)
+            self.fields_sort = SortHeader(0, lambda _s: self._refresh_fields())
+            self.tbl_fields.setHorizontalHeader(self.fields_sort)
             self.tbl_fields.itemSelectionChanged.connect(self._refresh_targets)
             fl.addWidget(self.tbl_fields)
             upper_l.addWidget(fbox, 1)
@@ -1456,6 +1533,8 @@ if not _needs_restart:
             gl = QVBoxLayout(box)
             self.tbl_manage = QTableWidget(0, 3)
             self.tbl_manage.setHorizontalHeaderLabels(["Field", "Type", "Category"])
+            self.manage_sort = SortHeader(0, lambda _s: self._refresh_manage())
+            self.tbl_manage.setHorizontalHeader(self.manage_sort)
             self._setup_table(self.tbl_manage, multi=True)
             gl.addWidget(self.tbl_manage)
 
@@ -1488,8 +1567,11 @@ if not _needs_restart:
                 '<span style="color:%s">%s</span>' % (color, msg) if color else msg)
 
         def _refresh_manage(self):
-            self.tbl_manage.setRowCount(len(self._fields))
-            for r, field in enumerate(self._fields):
+            # Rows map to _manage_rows, not _fields — the sort may reorder them.
+            self._manage_rows = self._apply_sort(
+                list(self._fields), self.manage_sort.state)
+            self.tbl_manage.setRowCount(len(self._manage_rows))
+            for r, field in enumerate(self._manage_rows):
                 self.tbl_manage.setItem(r, 0, QTableWidgetItem(field["name"]))
                 type_item = QTableWidgetItem(field["type"])
                 type_item.setForeground(QColor(_TYPE_COLOR.get(field["type"], C_TX0)))
@@ -1507,8 +1589,9 @@ if not _needs_restart:
                 self.manage_category.setCurrentIndex(-1)
 
         def _manage_selected(self):
+            # Index the SORTED list — table rows map to _manage_rows.
             rows = self.tbl_manage.selectionModel().selectedRows()
-            return [self._fields[r.row()]["name"]
+            return [self._manage_rows[r.row()]["name"]
                     for r in sorted(rows, key=lambda x: x.row())]
 
         def _apply_category(self):
@@ -1767,10 +1850,34 @@ if not _needs_restart:
             self.category_filter.setCurrentIndex(idx if idx >= 0 else 0)
             self.category_filter.blockSignals(False)
 
+        @staticmethod
+        def _name_key(name):
+            """Natural sort key: VF_Slot2 before VF_Slot10, not after.
+
+            Plain alphabetical scatters numbered field families ("Slot10" < "Slot2"),
+            which is the exact layout this tool encourages.
+            """
+            return [int(t) if t.isdigit() else t.lower()
+                    for t in re.split(r"(\d+)", name)]
+
+        @classmethod
+        def _apply_sort(cls, fields, state):
+            """Order `fields` by name for the header's sort state.
+
+            Sorts the BACKING LIST, not the view — row index must keep mapping to
+            the same field, since bind/delete resolve targets by row.
+            """
+            if state == SORT_NONE:
+                return fields
+            return sorted(fields, key=lambda f: cls._name_key(f["name"]),
+                          reverse=(state == SORT_DESC))
+
         def _refresh_fields(self):
             cat = self.category_filter.currentText()
             self._visible_fields = [f for f in self._fields
                                     if cat == "All" or f.get("category", "Default") == cat]
+            self._visible_fields = self._apply_sort(
+                self._visible_fields, self.fields_sort.state)
             self.tbl_fields.setRowCount(len(self._visible_fields))
             for r, field in enumerate(self._visible_fields):
                 self.tbl_fields.setItem(r, 0, QTableWidgetItem(field["name"]))
