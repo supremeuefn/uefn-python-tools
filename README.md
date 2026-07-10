@@ -68,3 +68,7 @@ Python — including every trap that will crash UEFN if done wrong.
 
 These tools memory-patch live UEFN editor state via `ctypes`. Use at your own risk, and
 save your work first.
+
+---
+
+*Made with Claude AI, Yes it's AI Slop*
