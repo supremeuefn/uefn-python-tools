@@ -1,50 +1,26 @@
 """Verse Fields + Binding Tool — create, manage, and bulk-bind Verse fields via MVVM.
 
-Standalone, single-file tool: needs only the editor's `unreal` module, the Python
-stdlib, and PySide6 (auto-installed on first run — restart UEFN once after).
-Run inside UEFN via:
+Standalone single-file tool: needs the editor's `unreal` module, the stdlib, and
+PySide6 (auto-installed on first run — restart UEFN once after). Run inside UEFN:
     Tools > Execute Python Script...  ->  verse_field_tool.py
-or from the UEFN Python console:
-    exec(open(r"<path to>/verse_field_tool.py").read())
 
-Lists every Verse field on a Widget Blueprint and binds it in one of two modes,
-chosen by the "Bind to" toggle:
+Binds Verse fields to ENGINE PROPERTIES (Text, ColorAndOpacity, ...), to
+SUB-WIDGET FIELDS on embedded child widgets (same type only), or to button
+EVENTS — one at a time, zipped in pairs, or in bulk by `#`-numbered patterns.
+Bindings needing a conversion NODE (texture/material -> Brush) cannot be
+authored (the subsystem has no setters for them); they are listed LOCKED.
 
-  ENGINE PROPERTIES   field -> a widget property (Text, ColorAndOpacity, …).
-  SUB-WIDGET FIELDS   field -> a Verse field on an EMBEDDED child widget instance
-                      (VF_Slot1Image -> Slot1.VF_SlotImage). Same-type only; the
-                      child's own bindable fields are read from its VerseClassFields.
-
-Three ways to bind, in either mode:
-  * Bind Selected        — one field to every selected target (fan-out).
-  * Bind Selected Pairs  — multi-select fields AND targets, zipped 1:1 in row order.
-  * Bulk by number       — pattern-match with `#` as the index placeholder:
-                           VF_Color#  -> Image#.ColorAndOpacity, or
-                           VF_Slot#Image -> Slot#.VF_SlotImage — all indices at once.
-
-WHAT IT CANNOT DO
-    Bindings needing a conversion NODE can't be authored (MVVMEditorSubsystem has
-    getters but no setters for them). So `texture`/`material`->Brush must be done in
-    the editor UI — the tool lists Brush LOCKED rather than omitting it. Note this
-    only affects binding to an engine Brush property; binding a parent `texture`
-    field to a CHILD `texture` field needs no conversion and works (the child owns
-    the Brush conversion internally).
-
-HARD-WON DETAILS (every one cost a crash or a corrupt asset to learn)
-    * MVVMBlueprintViewBinding.SourcePath is read-only; import_text() on the whole
-      struct bypasses the per-property guard. That is the only way to author one.
-    * Bindings pulled from the array are struct COPIES — the whole array must be
-      written back. This is also why remove_binding() silently no-ops.
-    * MemberParent for an ENGINE prop names the NATIVE class declaring it, not the
-      widget's own class. For a CHILD field it names the child's GENERATED class
-      (wrapped: /Script/UMG.WidgetBlueprintGeneratedClass'…_C'). Props inherited
-      from UWidget omit MemberParent and set bSelfContext=True.
-    * A child binding zeroes its source MemberGuid — the compiler re-resolves it by
-      name, so we never need the parent's protected NewVariables GUID.
-    * UEFN exposes a reduced widget set (no ProgressBar/Button/Border); Text arrives
-      via UEFN_TextBlock. ToolTipText is hidden — it type-matches message/string but
-      is not a visual bind target.
-    * Verse color structs bind DIRECTLY to SlateColor/LinearColor — no conversion.
+HARD-WON DETAILS (each cost a crash or a corrupt asset)
+    * MVVMBlueprintViewBinding.SourcePath is read-only; import_text() on the
+      whole struct bypasses the guard, and the whole array must be written back
+      (bindings are struct copies — also why remove_binding() silently no-ops).
+    * MemberParent names the class DECLARING the property: the native class for
+      engine props, the wrapped generated class for child fields; UWidget props
+      omit it (bSelfContext=True). Child sources zero their MemberGuid — the
+      compiler re-resolves by name.
+    * UEFN exposes a reduced widget set; Text arrives via UEFN_TextBlock.
+      ToolTipText is hidden on purpose (type-matches message but isn't visual).
+    * Verse color structs bind DIRECTLY to SlateColor/LinearColor.
 """
 
 import sys
@@ -111,9 +87,12 @@ except SystemExit:
 
 if not _needs_restart:
     import ctypes
+    import functools
     import os
     import re
+    import shutil
     import struct
+    import time
     import uuid
 
     import unreal
@@ -122,9 +101,11 @@ if not _needs_restart:
         QPushButton, QTableWidget, QTableWidgetItem, QLabel, QLineEdit,
         QHeaderView, QTextEdit, QSplitter, QComboBox, QAbstractItemView,
         QGroupBox, QTabWidget, QSpinBox, QMessageBox, QAbstractSpinBox,
+        QCheckBox,
     )
-    from PySide6.QtCore import Qt, QPointF, QRectF
-    from PySide6.QtGui import QColor, QPainter, QPen, QFont
+    from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
+    from PySide6.QtGui import (QColor, QPainter, QPen, QFont, QIntValidator,
+                               QDoubleValidator)
 
     # ═══════════════════════════════════════════════════════════════════════
     #  STYLE  (UE5 Slate palette)
@@ -220,6 +201,27 @@ if not _needs_restart:
         selection-background-color: {C_SELI}; border: 1px solid {C_BTNOUT};
         outline: none;
     }}
+    /* The indicator's BOX is styled here (background/border render fine); the
+       tick INSIDE it is painted in code -- see TickBox -- because this Qt build
+       ignores image/CSS-drawn glyphs on the subcontrol, the same limitation that
+       forced ArrowCombo. Without a box the tick floats on the panel with nothing
+       around it and reads as decoration rather than a control. */
+    QCheckBox {{ color: {C_TX0}; font-size: 11px; spacing: 7px; }}
+    QCheckBox::indicator {{
+        width: 15px; height: 15px; border-radius: 3px;
+        background-color: {C_INPUT}; border: 1px solid {C_BTN};
+    }}
+    QCheckBox::indicator:hover {{ border-color: {C_BTNOUT}; }}
+    QCheckBox::indicator:checked {{
+        background-color: {C_ACC}; border: 1px solid {C_ACC};
+    }}
+    QCheckBox::indicator:checked:hover {{
+        background-color: {C_AH}; border: 1px solid {C_AH};
+    }}
+    QCheckBox:disabled {{ color: {C_TX2}; }}
+    QCheckBox::indicator:disabled {{
+        background-color: {C_RECESS}; border: 1px solid {C_BTN};
+    }}
     QTextEdit {{
         background-color: {C_INPUT}; border: 1px solid {C_BTN}; color: {C_TX0};
         font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 11px;
@@ -274,6 +276,33 @@ if not _needs_restart:
             p.drawPolyline([QPointF(cx - 4, cy - 2),
                             QPointF(cx, cy + 2),
                             QPointF(cx + 4, cy - 2)])
+            p.end()
+
+    class TickBox(QCheckBox):
+        """QCheckBox that PAINTS its own tick.
+
+        Styling ::indicator (needed at all, or the native box is invisible on this
+        dark theme) makes Qt stop drawing the tick with it -- leaving a filled
+        accent square and no checkmark. Same build limitation as ArrowCombo's
+        arrow, same fix: draw the glyph in paintEvent, where it always shows.
+        """
+        def paintEvent(self, event):
+            super().paintEvent(event)
+            if not self.isChecked():
+                return
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = QPen(QColor("#ffffff" if self.isEnabled() else C_TX2))
+            pen.setWidthF(2.0)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            # Centre the tick in the 15px indicator the stylesheet draws at the
+            # left edge; the box is vertically centred in the widget.
+            cx, cy = 7.5, self.height() / 2
+            p.drawPolyline([QPointF(cx - 3.5, cy),
+                            QPointF(cx - 1.0, cy + 3.0),
+                            QPointF(cx + 3.5, cy - 3.0)])
             p.end()
 
     # Sort states for SortHeader, cycled in this order.
@@ -366,14 +395,9 @@ if not _needs_restart:
     }
 
     # (verse_type, widget_property_type) pairs that bind with NO conversion.
-    # Verified empirically; anything absent needs a conversion we cannot author.
-    #
-    # NOTE: int -> float is NOT here. The MVVM view *stores* an int->RenderOpacity
-    # binding without objecting and it survives reload, but it FAILS at compile:
-    #   "source 'VF_IntVar' (int64) does not match destination 'RenderOpacity'
-    #    (float). A conversion function is required."
-    # int64 -> double needs a Conv_* function (which we can't author from Python),
-    # so it must go through the editor UI — never offer it as a direct target.
+    # Verified empirically. int -> float is deliberately absent: the view stores
+    # an int->RenderOpacity binding but it FAILS at compile ("a conversion
+    # function is required"), and Conv_* nodes cannot be authored from Python.
     _DIRECT = {
         ("message", "Text"), ("string", "Text"),
         ("float", "float"), ("int", "int"), ("logic", "bool"),
@@ -464,6 +488,58 @@ if not _needs_restart:
             return native
         return _DECLARING_CLASS.get(prop_name, native)
 
+    # Events a Verse field may bind on a button: (label, candidate serialized
+    # names). The two button shapes name the SAME event differently — UEFN
+    # buttons use OnButtonBaseClicked/OnButtonCTA*, the native Custom Button
+    # uses OnButtonClicked/OnButton* — so each label carries candidates and the
+    # first one the class actually declares wins. Deliberately an allowlist:
+    # buttons declare many more delegates (Hovered, Selected, drag/drop, ...).
+    _EVENT_DELEGATES = (
+        ("On Clicked",     ("OnButtonBaseClicked", "OnButtonClicked", "OnClicked")),
+        ("On Highlight",   ("OnButtonCTAHighlight", "OnButtonHighlight")),
+        ("On Unhighlight", ("OnButtonCTAUnhighlight", "OnButtonUnhighlight")),
+    )
+
+    _widget_delegates_cache = {}
+
+    def _declares_delegate(cdo, name):
+        """Does this class really declare `name` as a multicast delegate?
+
+        Reflected as snake_case on the CDO (`on_button_base_clicked`). A real delegate
+        reads back as a delegate object; an unbound UWidget python method reads back as
+        `builtin_function_or_method_with_closure` -- that is the test.
+        """
+        snake = "_".join(w.lower() for w in re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]*", name))
+        value = getattr(cdo, snake, None)
+        if value is None:
+            return False
+        return type(value).__name__ != "builtin_function_or_method_with_closure"
+
+    def widget_event_delegates(class_path):
+        """[(serialized_name, label)] an event binding can target on this widget class.
+
+        Gate on the DELEGATE, never on class names: binding a delegate the class
+        does not declare makes the engine dereference garbage — an
+        EXCEPTION_ACCESS_VIOLATION that kills the editor (listing
+        OnButtonBaseClicked on every Image/TextBlock did exactly that).
+        """
+        if class_path in _widget_delegates_cache:
+            return _widget_delegates_cache[class_path]
+        found = []
+        try:
+            cls = unreal.load_object(None, class_path)
+            cdo = unreal.get_default_object(cls) if cls is not None else None
+            if cdo is not None:
+                for label, candidates in _EVENT_DELEGATES:
+                    for name in candidates:
+                        if _declares_delegate(cdo, name):
+                            found.append((name, label))
+                            break     # first match wins; never list one event twice
+        except Exception:
+            found = []
+        _widget_delegates_cache[class_path] = found
+        return found
+
     def widget_bindable_properties(native):
         """Bindable properties on a native widget class -> {name: value_type}."""
         cls = getattr(unreal, native, None) if native else None
@@ -497,14 +573,19 @@ if not _needs_restart:
         return None
 
     def list_verse_fields(wbp_path):
-        """[{name, type, ue5_class, category}] — types from the engine's own
-        VerseClassFields tag, category from the Blueprint variable itself."""
+        """[{name, type, ue5_class, category, param}] — types from the engine's
+        own VerseClassFields tag, category from the Blueprint variable itself.
+
+        `param` is the event field's parameter (int/float/logic) or None; it is
+        always None for a non-event field.
+        """
         asset = _el.find_asset_data(wbp_path)
         blob = str(asset.get_tag_value("VerseClassFields") or "")
         wbp = _el.load_asset(wbp_path)
         fields = []
-        pattern = r'\(Name="([^"]+)".*?Type=([A-Za-z]+),TypeUE5Class="([^"]*)"'
-        for name, raw_type, ue5_class in re.findall(pattern, blob):
+        pattern = (r'\(Name="([^"]+)".*?Type=([A-Za-z]+),TypeUE5Class="([^"]*)"'
+                   r'.*?EventParameters=(\([^)]*\)\)|)')
+        for name, raw_type, ue5_class, params in re.findall(pattern, blob):
             kind = _VERSE_TYPE.get(raw_type, raw_type.lower())
             if kind == "struct":
                 if ue5_class.endswith("Colors_color_alpha"):
@@ -513,12 +594,19 @@ if not _needs_restart:
                     kind = "color"
             elif kind == "asset":
                 kind = "texture" if "Texture2D" in ue5_class else "material"
+            # ((Type=Integer)) -> "int". The engine spells the parameter with the
+            # same Verse type names it uses for a field's own Type.
+            param = None
+            if kind == "event" and params:
+                inner = re.search(r'Type=([A-Za-z]+)', params)
+                if inner:
+                    param = _VERSE_TYPE.get(inner.group(1), inner.group(1).lower())
             try:
                 category = str(_bel.get_blueprint_variable_category(wbp, name))
             except Exception:
                 category = "Default"
-            fields.append({"name": name, "type": kind,
-                           "ue5_class": ue5_class, "category": category})
+            fields.append({"name": name, "type": kind, "ue5_class": ue5_class,
+                           "category": category, "param": param})
         return fields
 
     def _export_t3d(wbp):
@@ -568,14 +656,61 @@ if not _needs_restart:
             widgets.append({"name": name, "class_path": class_path, "native": native})
         return widgets
 
+    def list_event_widgets(wbp_path, entries=None):
+        """[{name, class_path, native, delegates}] for widgets an EVENT can bind.
+
+        Keeps a widget only if its class really declares the delegates — the
+        buttons — and excludes everything else by construction (offering a
+        delegate on an Image crashed the editor; see widget_event_delegates).
+        """
+        widgets, seen = [], set()
+        for class_path, name in (entries if entries is not None
+                                 else _widget_tree_entries(wbp_path)):
+            if name in seen:
+                continue
+            delegates = widget_event_delegates(class_path)
+            if not delegates:
+                continue
+            seen.add(name)
+            # `native` is the LEAF class name (UEFN_Button_Quiet_C) and must stay
+            # exact: MemberParent resolves the delegate's declaring class through
+            # it. `label`/`display` are cosmetic.
+            native = class_path.rsplit(".", 1)[-1].rstrip("'")
+            widgets.append({"name": name, "class_path": class_path,
+                            "native": native,
+                            "display": _widget_display_name(name, native),
+                            "label": _widget_class_label(native),
+                            "delegates": delegates})
+        return widgets
+
+    # Engine class name -> what the editor calls it. Display only.
+    _WIDGET_CLASS_LABELS = {
+        "UIFrameworkCustomButtonWidget": "Custom Button",
+        "UEFN_Button_Quiet_C": "UEFN Button Quiet",
+        "UEFN_Button_Regular_C": "UEFN Button Regular",
+        "UEFN_Button_Loud_C": "UEFN Button Loud",
+    }
+
+    def _widget_class_label(native):
+        """Friendly class name for the target table; falls back to the real one."""
+        return _WIDGET_CLASS_LABELS.get(native, native)
+
+    def _widget_display_name(name, native):
+        """What the editor's Hierarchy shows: an auto-generated object name
+        (class + serial, e.g. UIFrameworkCustomButtonWidget_53) displays as the
+        prettified class; a renamed widget shows its own name. Display only —
+        bindings key on the object name."""
+        stem = re.sub(r"_\d+$", "", name)
+        if stem == native or stem + "_C" == native:
+            return _widget_class_label(native)
+        return name
+
     def variable_guids(wbp_path):
         """Member VarName -> VarGuid, from the asset's own serialization.
 
-        Anchored to NewVariables(N)= entries: matches every MEMBER variable
-        regardless of naming convention (no VF_ prefix required), while excluding
-        function-local variables — those also serialize VarName/VarGuid, and
-        counting them would break create_verse_fields' NewVariables memory probe,
-        which requires an exact element count.
+        Anchored to NewVariables(N)= so function-LOCAL variables (which also
+        serialize VarName/VarGuid) are excluded — counting them would break the
+        NewVariables memory probe, which needs an exact element count.
         """
         wbp = _el.load_asset(wbp_path)
         text = _export_t3d(wbp)
@@ -583,23 +718,15 @@ if not _needs_restart:
             r'NewVariables\(\d+\)=\(VarName="([^"]+)",VarGuid=([A-F0-9]{32})', text))
 
     # ── child sub-widget discovery ───────────────────────────────────────────
-    #
-    # A parent Verse field can bind to a Verse field on an EMBEDDED child widget
-    # instance (VF_Slot1Image -> Slot1.VF_SlotImage). The destination names the
-    # child's GENERATED class as MemberParent and the child field as MemberName,
-    # with Source=Widget. Same-type field-to-field needs NO conversion — the Brush
-    # conversion (if any) lives inside the child. Verified working; see
-    # verse_field_tools.md "Field-to-field bindings".
+    # A parent field can bind a Verse field on an EMBEDDED child instance
+    # (VF_Slot1Image -> Slot1.VF_SlotImage): MemberParent = the child's
+    # GENERATED class, Source=Widget. Same-type only; no conversion needed.
 
     _child_fields_cache = {}
 
     def _class_path_to_asset(class_path):
-        """Generated-class path -> the child WBP object path it belongs to.
-
-        T3D exports the class bare ("/NewTesting/WC_Slot.WC_Slot_C"); bindings need
-        the wrapped form. Both reduce to the same package + short name minus "_C":
-        "/NewTesting/WC_Slot.WC_Slot_C" -> "/NewTesting/WC_Slot.WC_Slot".
-        """
+        """Generated-class path -> the child WBP object path:
+        "/NewTesting/WC_Slot.WC_Slot_C" -> "/NewTesting/WC_Slot.WC_Slot"."""
         inner = re.search(r"'([^']+)'", class_path)
         obj = (inner.group(1) if inner else class_path).strip()
         pkg, _, short = obj.partition(".")
@@ -769,19 +896,57 @@ if not _needs_restart:
         return _binding_string(p["field"], guid, p["widget"],
                                p["native"], p["prop"], binding_id)
 
+    # Whether the widget's editor tab was open, keyed by path. Set from
+    # close_all_editors_for_asset's return count, consumed by _reopen_editor.
+    _WAS_EDITOR_OPEN = {}
+
+    # Set by the UI to _reclaim_focus: reopening the widget raises UEFN, so the
+    # tool has to take the foreground back. A plain list so the engine-side code
+    # stays importable without Qt.
+    _ON_EDITOR_RAISED = []
+
+    # Non-zero while a guarded op runs, so a mid-operation _reload does not put
+    # the tab back only for the next pass to close it again (visible flicker). A
+    # count, not a flag: guarded calls nest.
+    _EDITOR_REOPEN_HELD = [0]
+
+    def _keeps_editor_open(operation):
+        """Restore the widget's editor tab (and the tool's focus) after a mutating
+        operation, on the failure path too.
+
+        Whether the tab closes depends on the DATA, not the function -- deleting a
+        plain field leaves it alone, deleting an EVENT field removes a graph and
+        closes it -- so every mutating entry point is wrapped rather than the ones
+        that look like they need it.
+
+        Nothing is probed up front: the only way to ask whether a tab is open is
+        to close it. Instead the code that actually closes it (_unload,
+        _close_editor) records that in _WAS_EDITOR_OPEN, and an operation that
+        never closes the tab leaves nothing to restore.
+        """
+        @functools.wraps(operation)
+        def wrapper(wbp_path, *args, **kwargs):
+            _EDITOR_REOPEN_HELD[0] += 1
+            try:
+                return operation(wbp_path, *args, **kwargs)
+            finally:
+                _EDITOR_REOPEN_HELD[0] -= 1
+                _reopen_editor(wbp_path)
+                for callback in _ON_EDITOR_RAISED:
+                    try:
+                        callback()
+                    except Exception:
+                        pass    # focus is cosmetic; never mask the real result
+        return wrapper
+
+    @_keeps_editor_open
     def apply_bindings(wbp_path, pairs, replace=True):
-        """Create bindings. Each pair is either:
+        """Create bindings; pairs are native tuples or child dicts (_normalize_pair).
 
-            native:  (field, widget, native, prop)                       [engine prop]
-            child:   {mode:'child', field, widget, class_path, child_field}
-
-        A destination holds at most one binding. With replace=True an existing
-        binding on the same destination is retargeted **reusing its BindingId** —
-        a fresh GUID would read to the engine as one binding vanishing and another
-        appearing. Bindings that use a conversion are never clobbered.
-
-        Returns {created, replaced, skipped} where each entry is
-        (field, widget, dest[, reason]).
+        A destination holds at most one binding. replace=True retargets an
+        existing one REUSING its BindingId (a fresh GUID reads as one binding
+        vanishing and another appearing); conversions are never clobbered.
+        Returns {created, replaced, skipped}.
         """
         guids = variable_guids(wbp_path)
         wbp = _el.load_asset(wbp_path)
@@ -837,6 +1002,7 @@ if not _needs_restart:
         _el.save_asset(wbp_path)
         return result
 
+    @_keeps_editor_open
     def remove_bindings(wbp_path, destinations):
         """Delete bindings by [(widget, prop)].
 
@@ -861,6 +1027,1550 @@ if not _needs_restart:
             _el.save_asset(wbp_path)
         return dropped
 
+    # ═══════════════════════════════════════════════════════════════════════
+    #  VERSE event() BINDINGS  (patched on disk)
+    # ═══════════════════════════════════════════════════════════════════════
+    #
+    # The engine API cannot author these: import_text survives a save but the next
+    # compile discards it. Patching the saved package works -- creating = cloning a
+    # working event's export, retargeting its FNames, and listing the copy in the
+    # view's Events array. Growing the package is safe only if every derived
+    # structure grows with it (each found via a distinct engine failure): every
+    # summary offset (zero = absent, never shift), the int64 heading the
+    # AssetRegistry blob, per-entry thumbnail offsets, the depends table, the
+    # FGenerationInfo counts, and the Events ArrayProperty tag's byte size.
+
+    _PACKAGE_TAG = 0x9E2A83C1
+
+    # A NameProperty's tag is fixed-size, so its FName value sits +25 from the
+    # tag: [+0 name][+8 "NameProperty"][+16 ArrayIndex][+20 size][+24 flags]
+    # [+25 value]. The stream is NOT int32-aligned; values are only reachable
+    # from a located tag, never by strided scan.
+    _NAME_VALUE_GAP = 25
+
+    # The Events ArrayProperty tag also names its element type, so the element
+    # count sits +37 from the tag, with the tag's byte-size field 5 before it.
+    _ARRAY_COUNT_GAP = 37
+
+    # A binding's "Param 0" is TEXT in a DefaultString StrProperty, nested in the
+    # export's SavedPins array (absent on a parameterless event):
+    #   SavedPins (Array) -> [0] MVVMBlueprintPin (Struct) -> DefaultString
+    # Resizing the string must also resize BOTH enclosing sizes and the export's
+    # SerialSize; miss one and the loader asserts ("Read 646B, expected 645B").
+    _PIN_ARRAY_TAG = "SavedPins"
+    _PIN_DEFAULT_TAG = "DefaultString"
+
+    # Simple tag: [+0 name][+8 type][+16 idx][+20 size][+24 flags][+25 value].
+    _PROPERTY_SIZE_FIELD = 20
+
+    # An ARRAY-of-structs tag also names its inner type and the struct, so its size
+    # lands at +56, NOT +20 (+20 reads as 249 -- the mistake that crashed UEFN).
+    _ARRAY_SIZE_FIELD = 56
+
+    # What an untouched "Param 0" box holds, spelled as the engine spells it.
+    _EVENT_PARAM_DEFAULTS = {"int": "0", "float": "0.0", "logic": "false"}
+
+    # The SavedPins block as a package-INDEPENDENT recipe, so a pin can be BUILT
+    # rather than cloned from a donor the widget may not have (measured: the block
+    # is the same for every widget and param type -- only the value and the two
+    # sizes differ). Ops, not bytes, because its FNames are per-package indices:
+    #     bare token -> FName ("Name" or "Name#number"), resolved per package
+    #     hex token  -> literal bytes (sizes, counts, flags)
+    # No name here is valid hex, so the two never collide.
+    _PIN_TEMPLATE = (
+        "SavedPins ArrayProperty 01000000 StructProperty 01000000 "
+        "MVVMBlueprintPin "
+        "010000000500000000000000000000008502000000010000009700000000000000 "
+        "StructProperty 01000000 MVVMBlueprintPinId "
+        "010000000500000000000000000000003900000000 PinNames ArrayProperty "
+        "01000000 NameProperty 000000000c0000000001000000 Param0 None Path "
+        "StructProperty 01000000 MVVMBlueprintPropertyPath "
+        "010000000500000000000000000000002201000000 Paths ArrayProperty "
+        "01000000 StructProperty 01000000 MVVMBlueprintFieldPath "
+        "01000000050000000000000000000000040000000000000000 WidgetName "
+        "NameProperty 000000000800000000 None ContextId StructProperty "
+        "01000000 Guid 010000 Type "
+        "0000000000100000000800000000000000000000000000000000 Source "
+        "EnumProperty 02000000 EMVVMBlueprintFieldPathSource "
+        "01000000050000000000000000000000 ByteProperty "
+        "0000000008000000006f00000000000000 bIsComponent BoolProperty "
+        "000000000000000000 bDeprecatedSource BoolProperty 000000000000000000 "
+        "None DefaultString StrProperty 000000000600000000020000003000 "
+        "DefaultText TextProperty 00000000090000000000000000ff00000000 "
+        "DefaultObject ObjectProperty 00000000040000000000000000 bSplit "
+        "BoolProperty 000000000000000000 Status EnumProperty 02000000 "
+        "EMVVMBlueprintPinStatus 01000000050000000000000000000000 "
+        "ByteProperty 0000000008000000007300000000000000 None")
+
+    # The template is emitted with the int default ("0"), so the block it builds
+    # is the int binding's byte for byte. _build_pin_block then rewrites the value
+    # for whatever type is wanted -- proven to reproduce the float and logic
+    # bindings' blocks exactly.
+    _PIN_TEMPLATE_VALUE = "0"
+
+    # FObjectExport starts ClassIndex/SuperIndex/TemplateIndex/OuterIndex (int32
+    # each), then ObjectName at +16, ObjectFlags, SerialSize/SerialOffset.
+    _EXPORT_NAME_FIELD = 16
+
+    # FObjectImport is a FIXED 40-byte record: ClassPackage, ClassName, OuterIndex,
+    # then ObjectName at +20. Do NOT "derive" the stride by testing whether name
+    # indices look valid — a smaller stride also passes and silently reads half
+    # the table.
+    _IMPORT_ENTRY_SIZE = 40
+    _IMPORT_NAME_FIELD = 20
+
+    # The UE object versions the summary parse branches on.
+    _UE5_ADD_SOFTOBJECTPATH_LIST = 1008
+    _UE5_METADATA_SERIALIZATION_OFFSET = 1014
+    _UE5_VERSE_CELLS = 1015
+    _UE5_PACKAGE_SAVED_HASH = 1016
+    _UE5_IMPORT_TYPE_HIERARCHIES = 1018
+    _UE4_ADD_STRING_ASSET_REFERENCES_MAP = 384
+    _UE4_SERIALIZE_TEXT_IN_PACKAGES = 459
+    _UE4_ADDED_SEARCHABLE_NAMES = 510
+    _UE4_ADDED_LOCALIZATION_ID = 516
+
+    def _crc_table(poly, reflected):
+        table = []
+        for i in range(256):
+            if reflected:
+                c = i
+                for _ in range(8):
+                    c = (c >> 1) ^ (poly if c & 1 else 0)
+            else:
+                c = i << 24
+                for _ in range(8):
+                    c = (((c << 1) ^ poly) if c & 0x80000000
+                         else (c << 1)) & 0xFFFFFFFF
+            table.append(c)
+        return table
+
+    _CRC_DEPRECATED = _crc_table(0x04C11DB7, reflected=False)
+    _CRC_REFLECTED = _crc_table(0xEDB88320, reflected=True)
+
+    def _strihash(text):
+        """UE's Strihash_DEPRECATED — the case-insensitive half of a name's hash.
+
+        UE upper-cases with TChar::ToUpper, which is ASCII-only, so str.upper()
+        would hash accented names differently.
+        """
+        h = 0
+        for ch in text:
+            code = ord(ch)
+            if 0 <= code - ord("a") < 26:
+                ch = chr(code - 32)
+            for byte in ch.encode("utf-8"):
+                h = ((h >> 8) & 0x00FFFFFF) ^ _CRC_DEPRECATED[(h ^ byte) & 0xFF]
+        return h & 0xFFFFFFFF
+
+    def _strcrc32(text):
+        """UE's StrCrc32 — the case-preserving half. Feeds 4 bytes per character."""
+        crc = 0xFFFFFFFF
+        for ch in text:
+            code = ord(ch)
+            for _ in range(4):
+                crc = (crc >> 8) ^ _CRC_REFLECTED[(crc ^ (code & 0xFF)) & 0xFF]
+                code >>= 8
+        return (~crc) & 0xFFFFFFFF
+
+    def _name_hashes(text):
+        """The two uint16 hashes UE stores after each name-map entry.
+
+        Verified against every name in a real UEFN package: 336/336 exact.
+        """
+        return struct.pack("<HH",
+                           _strihash(text) & 0xFFFF, _strcrc32(text) & 0xFFFF)
+
+    def _split_fname(text):
+        """Inverse of fname(): "Foo_24" -> ("Foo", 25); "Foo" -> ("Foo", 0).
+
+        A numeric tail with a leading zero ("Foo_05") is part of the literal
+        name, matching how UE parses these.
+        """
+        head, sep, tail = text.rpartition("_")
+        if sep and tail.isdigit() and not tail.startswith("0"):
+            return head, int(tail) + 1
+        if sep and tail == "0":
+            return head, 1
+        return text, 0
+
+    class _PkgReader:
+        """Little-endian cursor over the package bytes."""
+
+        def __init__(self, data, pos=0):
+            self.data = data
+            self.pos = pos
+
+        def i32(self):
+            v = struct.unpack_from("<i", self.data, self.pos)[0]
+            self.pos += 4
+            return v
+
+        def u32(self):
+            v = struct.unpack_from("<I", self.data, self.pos)[0]
+            self.pos += 4
+            return v
+
+        def i64(self):
+            v = struct.unpack_from("<q", self.data, self.pos)[0]
+            self.pos += 8
+            return v
+
+        def fstring(self):
+            """UE FString: int32 length; negative means UTF-16. NUL-terminated."""
+            n = self.i32()
+            if n == 0:
+                return ""
+            if n < 0:
+                raw = self.data[self.pos:self.pos + (-n) * 2]
+                self.pos += (-n) * 2
+                return raw.decode("utf-16-le").rstrip("\x00")
+            raw = self.data[self.pos:self.pos + n]
+            self.pos += n
+            return raw.decode("utf-8", "replace").rstrip("\x00")
+
+    def _read_engine_version(r):
+        """FEngineVersion: major/minor/patch (uint16 each), changelist, branch."""
+        r.pos += 6
+        r.u32()
+        r.fstring()
+
+    class _Package:
+        """A parsed UEFN (UE5.8) package that can retarget AND grow its events.
+
+        The summary parse records where every stored file offset lives, because
+        an insertion anywhere invalidates all of them at once.
+        """
+
+        def __init__(self, path):
+            self.path = path
+            with open(path, "rb") as handle:
+                self.data = bytearray(handle.read())
+            self.export_entry_size = None
+            self._parse_summary()
+            self._parse_name_map()
+            self._parse_imports()
+            self._parse_exports()
+
+        def save(self, path=None):
+            """Write the package out, to `path` if given, else where it came from.
+
+            The event patchers read a pre-unload SNAPSHOT of the asset and write
+            the result to the live file, so the two paths differ.
+            """
+            with open(path or self.path, "wb") as handle:
+                handle.write(self.data)
+
+        def _reparse(self):
+            self._parse_summary()
+            self._parse_name_map()
+            self._parse_imports()
+            self._parse_exports()
+
+        # -- summary --------------------------------------------------------
+
+        def _parse_summary(self):
+            r = _PkgReader(self.data)
+            if r.u32() != _PACKAGE_TAG:
+                raise RuntimeError("not a .uasset (bad package tag)")
+            if r.i32() != -9:
+                raise RuntimeError("unsupported package version (expected UE5.8)")
+
+            r.i32()                   # LegacyUE3Version
+            self.ue4_version = r.i32()
+            self.ue5_version = r.i32()
+            r.i32()                   # FileVersionLicenseeUE
+            if self.ue5_version < _UE5_IMPORT_TYPE_HIERARCHIES:
+                raise RuntimeError(
+                    "package predates UE5.8 (UE5 version %d)" % self.ue5_version)
+
+            # UE5.8: FIoHash SavedHash + SectionSixOffset (doubles as header
+            # size) precede the custom version container.
+            r.pos += 20               # SavedHash
+            self.section_six_offset_off = r.pos
+            r.i32()
+            # Two statements: `r.pos += r.i32() * 20` reads the OLD r.pos.
+            n_custom = r.i32()
+            r.pos += n_custom * 20    # custom versions: FGuid + int32 each
+            r.fstring()               # FolderName
+            r.u32()                   # PackageFlags
+
+            # Remember WHERE each stored file offset lives, not just its value —
+            # an insertion must correct every one that points past it.
+            self.offset_fields = {}
+
+            def offset_field(label):
+                self.offset_fields[label] = r.pos
+                return r.i32()
+
+            self.name_count_off = r.pos
+            self.name_count = r.i32()
+            self.name_offset = offset_field("name")
+
+            if self.ue5_version >= _UE5_ADD_SOFTOBJECTPATH_LIST:
+                r.i32()
+                offset_field("soft_object_paths")
+            if self.ue4_version >= _UE4_ADDED_LOCALIZATION_ID:
+                r.fstring()           # LocalizationId
+            if self.ue4_version >= _UE4_SERIALIZE_TEXT_IN_PACKAGES:
+                r.i32()
+                offset_field("gatherable_text")
+
+            self.export_count_off = r.pos
+            self.export_count = r.i32()
+            self.export_offset = offset_field("export")
+            self.import_count = r.i32()
+            self.import_offset = offset_field("import")
+
+            if self.ue5_version >= _UE5_VERSE_CELLS:
+                r.i32()
+                offset_field("cell_export")
+                r.i32()
+                offset_field("cell_import")
+            if self.ue5_version >= _UE5_METADATA_SERIALIZATION_OFFSET:
+                offset_field("metadata")
+
+            self.depends_offset = offset_field("depends")
+            if self.ue4_version >= _UE4_ADD_STRING_ASSET_REFERENCES_MAP:
+                r.i32()
+                offset_field("soft_package_references")
+            if self.ue4_version >= _UE4_ADDED_SEARCHABLE_NAMES:
+                offset_field("searchable_names")
+            offset_field("thumbnail_table")
+            if self.ue5_version >= _UE5_IMPORT_TYPE_HIERARCHIES:
+                r.i32()
+                offset_field("import_type_hierarchies")
+
+            if self.ue5_version < _UE5_PACKAGE_SAVED_HASH:
+                r.pos += 16           # PackageGuid
+            r.pos += 16               # PersistentGuid
+
+            generations = r.i32()
+            if not 0 <= generations <= 16:
+                raise RuntimeError("summary desync: generations=%d" % generations)
+            # Each generation snapshots (ExportCount, NameCount); the engine
+            # cross-checks the last one, so growing a table must update it here.
+            self.generation_entries = []
+            for _ in range(generations):
+                self.generation_entries.append(r.pos)
+                r.pos += 8
+
+            _read_engine_version(r)   # RecordedEngineVersion
+            _read_engine_version(r)   # RecordedCompatibleWithEngineVersion
+
+            r.u32()                   # CompressionFlags
+            if r.i32():
+                raise RuntimeError("package-level compression is not supported")
+            r.u32()                   # PackageSource
+            for _ in range(r.i32()):  # AdditionalPackagesToCook
+                r.fstring()
+
+            self.asset_registry_offset = offset_field("asset_registry")
+
+            # 64-bit pair: the engine reads (PayloadToc - BulkDataStart) bytes,
+            # so shifting one without the other yields a negative length.
+            self.bulk_data_offset_off = r.pos
+            self.bulk_data_offset = r.i64()
+
+            offset_field("world_tile_info")
+            n_chunks = r.i32()
+            r.pos += n_chunks * 4
+            r.i32()                   # PreloadDependencyCount (-1 when absent)
+            offset_field("preload_dependency")
+            r.i32()                   # NamesReferencedFromExportDataCount
+            self.payload_toc_off = r.pos
+            r.i64()
+            offset_field("data_resource")
+
+            # The summary is byte-packed, so a mis-parse lands silently on
+            # adjacent data. One invariant pins it: the header ends exactly
+            # where the name map begins.
+            if r.pos != self.name_offset:
+                raise RuntimeError(
+                    "summary parse desynced: header ends at 0x%X, name map "
+                    "starts at 0x%X" % (r.pos, self.name_offset))
+
+        # -- name map ---------------------------------------------------------
+
+        def _parse_name_map(self):
+            r = _PkgReader(self.data, self.name_offset)
+            self.names = []
+            for _ in range(self.name_count):
+                self.names.append(r.fstring())
+                r.pos += 4            # the two case-folding hashes
+            self.name_index = {n: i for i, n in enumerate(self.names)}
+
+        def fname(self, index, number):
+            """Render an FName. A nonzero number is stored one higher than it reads."""
+            if not 0 <= index < len(self.names):
+                return None
+            base = self.names[index]
+            return base if number == 0 else "%s_%d" % (base, number - 1)
+
+        # -- import table -------------------------------------------------------
+
+        def _parse_imports(self):
+            """ObjectName -> package index (the Nth import is -(N+1)).
+
+            The delegate's MemberParent stores one of these, naming the class
+            that DECLARES the delegate; retargeting a clone across button types
+            must update it or the engine reports the delegate as <None>.
+            """
+            data, base = self.data, self.import_offset
+            self.imports = {}
+            if not base or self.import_count <= 0:
+                return
+            end = base + self.import_count * _IMPORT_ENTRY_SIZE
+            if end > len(data):
+                return
+            for i in range(self.import_count):
+                index, number = struct.unpack_from(
+                    "<ii", data, base + i * _IMPORT_ENTRY_SIZE + _IMPORT_NAME_FIELD)
+                name = self.fname(index, number)
+                # First wins: an earlier import is the one MemberParent references.
+                if name is not None and name not in self.imports:
+                    self.imports[name] = -(i + 1)
+
+        # -- export table -------------------------------------------------------
+
+        def _parse_exports(self):
+            data, base = self.data, self.export_offset
+            if self.export_entry_size is None:
+                self.export_entry_size = self._derive_export_entry_size()
+            self.exports = []
+            for i in range(self.export_count):
+                entry = base + i * self.export_entry_size
+                index, number = struct.unpack_from(
+                    "<ii", data, entry + _EXPORT_NAME_FIELD)
+                self.exports.append({
+                    "name": self.fname(index, number),
+                    "entry": entry,
+                    "offset": struct.unpack_from("<q", data, entry + 36)[0],
+                    "size": struct.unpack_from("<q", data, entry + 28)[0],
+                })
+
+        def _derive_export_entry_size(self):
+            """Infer the FObjectExport stride rather than hard-coding it.
+
+            Export bodies are stored consecutively, so the second entry's
+            SerialOffset must equal the first's offset plus its size, and only
+            the true stride satisfies that.
+            """
+            data, base = self.data, self.export_offset
+            size0 = struct.unpack_from("<q", data, base + 28)[0]
+            off0 = struct.unpack_from("<q", data, base + 36)[0]
+            for stride in range(72, 152, 4):
+                probe = base + stride
+                if probe + 44 > len(data):
+                    break
+                if struct.unpack_from("<q", data, probe + 36)[0] == off0 + size0:
+                    return stride
+            raise RuntimeError("could not determine the export table stride")
+
+        # -- fname lookups ------------------------------------------------------
+
+        def find_fname(self, export, value):
+            """Byte offsets inside `export` holding the FName `value`."""
+            base, number = _split_fname(value)
+            index = self.name_index.get(base)
+            if index is None:
+                return []
+            needle = struct.pack("<ii", index, number)
+            start, end = export["offset"], export["offset"] + export["size"]
+            found, at = [], self.data.find(needle, start, end)
+            while at != -1:
+                found.append(at)
+                at = self.data.find(needle, at + 1, end)
+            return found
+
+        def set_fname(self, offset, value):
+            """Point the FName at `offset` at `value`, which must already exist.
+
+            Names are added up front by the operations that need them; by the
+            time a value is being written, byte offsets are live and growing the
+            map would shift the very bytes just located.
+            """
+            base, number = _split_fname(value)
+            if base not in self.name_index:
+                raise RuntimeError(
+                    "%r is not in the name map; add it before locating offsets"
+                    % value)
+            struct.pack_into("<ii", self.data, offset,
+                             self.name_index[base], number)
+
+        def read_fstring(self, at):
+            """Decode the FString at `at` -> (text, size in bytes).
+
+            The length field counts CHARACTERS INCLUDING the terminating NUL,
+            and its sign picks the encoding: negative means UTF-16, positive
+            ASCII. Empty strings store a length of 0 and no payload at all.
+            """
+            count = struct.unpack_from("<i", self.data, at)[0]
+            if count == 0:
+                return "", 4
+            if count < 0:
+                size = 4 - count * 2
+                raw = bytes(self.data[at + 4:at + size - 2])
+                return raw.decode("utf-16-le"), size
+            size = 4 + count
+            raw = bytes(self.data[at + 4:at + size - 1])
+            return raw.decode("utf-8", "replace"), size
+
+        @staticmethod
+        def encode_fstring(text):
+            """Pack `text` as an FString. ASCII where it can, UTF-16 otherwise —
+            the same choice the engine makes, so a value it wrote round-trips to
+            the identical bytes."""
+            if not text:
+                return struct.pack("<i", 0)
+            try:
+                raw = text.encode("ascii") + b"\x00"
+                return struct.pack("<i", len(raw)) + raw
+            except UnicodeEncodeError:
+                raw = text.encode("utf-16-le") + b"\x00\x00"
+                return struct.pack("<i", -(len(raw) // 2)) + raw
+
+        def find_tag(self, export, name):
+            """Byte offset of the property tag named `name` inside `export`.
+
+            A tag opens with its FName, so this is find_fname plus the check
+            that what follows really is a tag -- the same 8 bytes could occur
+            inside a payload by chance.
+            """
+            for at in self.find_fname(export, name):
+                type_name = self.fname(
+                    *struct.unpack_from("<ii", self.data, at + 8))
+                if type_name and type_name.endswith("Property"):
+                    return at
+            return None
+
+        # -- structural edits (these RESIZE the package) --------------------------
+
+        def _shift_offsets(self, at, delta):
+            """Move every stored offset pointing at or past `at` by `delta`.
+
+            >= not >: bytes inserted exactly where a table starts push it along.
+            """
+            data = self.data
+
+            # Read the thumbnail table's position BEFORE the loop relocates the
+            # field recording it (the buffer itself has not been mutated yet).
+            table_pos = self.offset_fields.get("thumbnail_table")
+            table_at = (struct.unpack_from("<i", data, table_pos)[0]
+                        if table_pos is not None else 0)
+
+            # A zero offset means "table absent", never shift it.
+            for pos in self.offset_fields.values():
+                value = struct.unpack_from("<i", data, pos)[0]
+                if value > 0 and value >= at:
+                    struct.pack_into("<i", data, pos, value + delta)
+
+            # SectionSixOffset doubles as the total header size in UE5.8.
+            value = struct.unpack_from("<i", data, self.section_six_offset_off)[0]
+            if value >= at:
+                struct.pack_into("<i", data, self.section_six_offset_off,
+                                 value + delta)
+
+            for pos in (self.bulk_data_offset_off, self.payload_toc_off):
+                value = struct.unpack_from("<q", data, pos)[0]
+                if value >= at:
+                    struct.pack_into("<q", data, pos, value + delta)
+
+            # The thumbnail table stores an absolute file offset PER ENTRY;
+            # a stale one makes the engine read garbage as a compressed size
+            # ("Requested read of 33554432 bytes when 141656 bytes remain").
+            if table_at > 0:
+                pos = table_at + 4
+                for _ in range(struct.unpack_from("<i", data, table_at)[0]):
+                    for _ in range(2):        # class name, object path
+                        n = struct.unpack_from("<i", data, pos)[0]
+                        pos += 4 + (n if n >= 0 else -n * 2)
+                    value = struct.unpack_from("<i", data, pos)[0]
+                    if value >= at:
+                        struct.pack_into("<i", data, pos, value + delta)
+                    pos += 4
+
+            # The asset registry blob opens with an int64 pointing at its own
+            # dependency section; missing it = "Package is unloadable.
+            # Reason: SerializeAssetRegistryDependencyData".
+            if self.asset_registry_offset > 0:
+                pos = self.asset_registry_offset
+                value = struct.unpack_from("<q", data, pos)[0]
+                if value >= at:
+                    struct.pack_into("<q", data, pos, value + delta)
+
+            for export in self.exports:
+                if export["offset"] >= at:
+                    struct.pack_into("<q", data, export["entry"] + 36,
+                                     export["offset"] + delta)
+
+        def _depends_end(self, entries=None):
+            """File offset just past the last depends entry (found by walking:
+            one entry per export, int32 count + that many indices, no length of
+            its own). `entries` overrides the walk count for the moment during
+            a clone when the export count is bumped but the table isn't yet."""
+            pos = self.depends_offset
+            for i in range(self.export_count if entries is None else entries):
+                count = struct.unpack_from("<i", self.data, pos)[0]
+                pos += 4
+                if not 0 <= count < 10000:
+                    raise RuntimeError(
+                        "depends entry %d has an implausible count (%d)"
+                        % (i, count))
+                pos += count * 4
+            return pos
+
+        def add_name(self, text):
+            """Append `text` to the name map and return its index.
+
+            The name map sits ahead of every other table, so growing it shifts
+            the whole file. Names are stored as an FString plus two hashes.
+            """
+            if text in self.name_index:
+                return self.name_index[text]
+
+            encoded = text.encode("utf-8") + b"\x00"
+            entry = (struct.pack("<i", len(encoded)) + encoded
+                     + _name_hashes(text))
+
+            r = _PkgReader(self.data, self.name_offset)
+            for _ in range(self.name_count):
+                r.fstring()
+                r.pos += 4
+            insert_at = r.pos
+
+            # Correct the stored offsets BEFORE the insertion; afterwards every
+            # recorded position would itself be stale.
+            self._shift_offsets(insert_at, len(entry))
+            struct.pack_into("<i", self.data, self.name_count_off,
+                             self.name_count + 1)
+            # The latest generation snapshot repeats the name count and must
+            # agree with the table it describes.
+            if self.generation_entries:
+                pos = self.generation_entries[-1] + 4
+                count = struct.unpack_from("<i", self.data, pos)[0]
+                struct.pack_into("<i", self.data, pos, count + 1)
+            self.data[insert_at:insert_at] = entry
+
+            self._reparse()
+            return self.name_index[text]
+
+        def clone_export(self, source, object_name):
+            """Append a copy of export dict `source`, named `object_name`.
+
+            The clone reuses the source's preload-dependency range (valid: the
+            two exports have identical dependencies).
+            """
+            if any(e["name"] == object_name for e in self.exports):
+                raise RuntimeError("export %r already exists" % object_name)
+
+            base, number = _split_fname(object_name)
+            name_index = self.add_name(base)
+
+            # add_name() reparsed; re-resolve the source against the new layout.
+            source = next(e for e in self.exports
+                          if e["name"] == source["name"])
+            body = bytes(self.data[source["offset"]:
+                                   source["offset"] + source["size"]])
+            entry = bytearray(self.data[source["entry"]:
+                                        source["entry"] + self.export_entry_size])
+            struct.pack_into("<ii", entry, _EXPORT_NAME_FIELD,
+                             name_index, number)
+
+            table_end = (self.export_offset
+                         + self.export_count * self.export_entry_size)
+            self._shift_offsets(table_end, self.export_entry_size)
+            struct.pack_into("<i", self.data, self.export_count_off,
+                             self.export_count + 1)
+            # The latest generation snapshot repeats the export count too.
+            if self.generation_entries:
+                pos = self.generation_entries[-1]
+                count = struct.unpack_from("<i", self.data, pos)[0]
+                struct.pack_into("<i", self.data, pos, count + 1)
+            self.data[table_end:table_end] = entry
+
+            # Reparse between inserts: a second shift over stale parsed state
+            # would skip entries that already moved.
+            self._reparse()
+
+            # Every export needs a depends entry or the engine reads one short
+            # and takes the next table's bytes as a length. The clone depends
+            # on nothing: a bare count of 0.
+            depends_at = self._depends_end(entries=self.export_count - 1)
+            self._shift_offsets(depends_at, 4)
+            self.data[depends_at:depends_at] = struct.pack("<i", 0)
+            self._reparse()
+
+            # Export bodies tile exactly up to BulkDataStartOffset, so the
+            # clone's body goes there — a gap breaks the registry read.
+            body_at = self.bulk_data_offset
+            new = self.exports[-1]
+            struct.pack_into("<q", self.data, new["entry"] + 28, len(body))
+            struct.pack_into("<q", self.data, new["entry"] + 36, body_at)
+
+            self._shift_offsets(body_at, len(body))
+            self.data[body_at:body_at] = body
+            # The shift above also moved the clone's own SerialOffset, which
+            # must stay pointing at the body rather than past it.
+            struct.pack_into("<q", self.data, new["entry"] + 36, body_at)
+
+            self._reparse()
+            return self.exports[-1]
+
+    # Ancestors a delegate may be DECLARED on. The declaring class differs PER
+    # DELEGATE, not per widget: a UEFN button inherits OnButtonBaseClicked from
+    # CommonButtonBase but declares OnButtonCTAHighlight on ITSELF — mapping the
+    # whole widget to one class makes the compiler report <None> for the other.
+    _DELEGATE_ANCESTORS = ("CommonButtonBase",)
+
+    def _delegate_declaring_classes(wbp_path):
+        """(widget, delegate) -> the class that declares that delegate, asked of
+        the engine (never pattern-matched from the name)."""
+        owners = {}
+        for w in list_event_widgets(wbp_path):
+            for delegate, _label in w["delegates"]:
+                owner = w["native"]           # leaf class, unless an ancestor owns it
+                for ancestor in _DELEGATE_ANCESTORS:
+                    base = getattr(unreal, ancestor, None)
+                    base_cdo = (unreal.get_default_object(base)
+                                if base is not None else None)
+                    if base_cdo is not None and _declares_delegate(base_cdo, delegate):
+                        owner = ancestor
+                        break
+                owners[(w["name"], delegate)] = owner
+        return owners
+
+    def _package_events(pkg):
+        """[(export, {widget,delegate,field,graph[,parent]} -> byte offset)].
+
+        EventPath serializes before DestinationPath: the FIRST MemberName is the
+        widget's delegate, the LAST is the Verse field. `parent` is EventPath's
+        MemberParent — the package index of the class DECLARING the delegate;
+        a clone crossing button types must rewrite it or the compiler reports
+        the delegate as <None> and the event will not generate.
+        """
+        events = []
+        for export in pkg.exports:
+            if not str(export["name"] or "").startswith("MVVMBlueprintViewEvent"):
+                continue
+            members = sorted(pkg.find_fname(export, "MemberName"))
+            widgets = sorted(pkg.find_fname(export, "WidgetName"))
+            graphs = sorted(pkg.find_fname(export, "GraphName"))
+            parents = sorted(pkg.find_fname(export, "MemberParent"))
+            if len(members) < 2 or not widgets or not graphs:
+                continue          # an empty shell the editor made but never filled
+            slots = {
+                "delegate": members[0] + _NAME_VALUE_GAP,
+                "field": members[-1] + _NAME_VALUE_GAP,
+                "widget": widgets[0] + _NAME_VALUE_GAP,
+                "graph": graphs[0] + _NAME_VALUE_GAP,
+            }
+            if parents:
+                # Same 25-byte tag->value gap as an FName property's.
+                slots["parent"] = parents[0] + _NAME_VALUE_GAP
+            # A parameterised event carries the panel's "Param 0" value here.
+            # Absent on a parameterless one -- there is no pin to give a value.
+            pin = pkg.find_tag(export, _PIN_DEFAULT_TAG)
+            if pin is not None:
+                slots["param_value"] = pin
+            events.append((export, slots))
+        return events
+
+    def _read_slot(pkg, offset):
+        return pkg.fname(*struct.unpack_from("<ii", pkg.data, offset))
+
+    def _read_param_value(pkg, slots):
+        """The binding's "Param 0" as text, or None if it takes no parameter."""
+        at = slots.get("param_value")
+        if at is None:
+            return None
+        return pkg.read_fstring(at + _NAME_VALUE_GAP)[0]
+
+    def _set_param_value(pkg, event_name, value):
+        """Write the binding's "Param 0" (text: "7", "2.5", "true").
+
+        Changing the string's length must move FOUR sizes together -- the array's,
+        DefaultString's, the FString's own count, and the export's SerialSize --
+        plus every offset past the edit. Miss one and the package still parses
+        here but crashes the editor's loader on reload, so the enclosure is
+        re-checked below rather than trusted.
+        """
+        slots = next((s for e, s in _package_events(pkg)
+                      if e["name"] == event_name), None)
+        if slots is None:
+            raise RuntimeError("no such event: %s" % event_name)
+        at = slots.get("param_value")
+        if at is None:
+            raise RuntimeError(
+                "%s is bound to a parameterless event field, so it has no "
+                "parameter to set" % event_name)
+
+        export = next(e for e in pkg.exports if e["name"] == event_name)
+        array = pkg.find_tag(export, _PIN_ARRAY_TAG)
+        if array is None:
+            raise RuntimeError(
+                "%s has a pin value but no %s array to hold it"
+                % (event_name, _PIN_ARRAY_TAG))
+
+        value_at = at + _NAME_VALUE_GAP
+        old_size = pkg.read_fstring(value_at)[1]
+        new = pkg.encode_fstring(value)
+        delta = len(new) - old_size
+
+        tag_size_at = at + _PROPERTY_SIZE_FIELD
+        array_size_at = array + _ARRAY_SIZE_FIELD
+        tag_size = struct.unpack_from("<i", pkg.data, tag_size_at)[0]
+        array_size = struct.unpack_from("<i", pkg.data, array_size_at)[0]
+
+        # The two sizes are only meaningful if they really describe these bytes.
+        # An FName scan can match inside another property's payload, so prove the
+        # relationship instead of assuming the offsets landed correctly.
+        if tag_size != old_size:
+            raise RuntimeError(
+                "%s: DefaultString claims %d bytes but its string is %d"
+                % (event_name, tag_size, old_size))
+        array_payload = array_size_at + 4
+        if not array_payload <= at < array_payload + array_size:
+            raise RuntimeError(
+                "%s: the %s array (payload %d bytes) does not enclose its "
+                "DefaultString -- refusing to resize"
+                % (event_name, _PIN_ARRAY_TAG, array_size))
+
+        if delta:
+            struct.pack_into("<i", pkg.data, tag_size_at, tag_size + delta)
+            struct.pack_into("<i", pkg.data, array_size_at, array_size + delta)
+            struct.pack_into("<q", pkg.data, export["entry"] + 28,
+                             export["size"] + delta)
+            # Shift from just PAST the old string: the bytes being replaced do
+            # not move, everything after them does.
+            pkg._shift_offsets(value_at + old_size, delta)
+
+        pkg.data[value_at:value_at + old_size] = new
+        pkg._reparse()
+
+    def _wbp_file(wbp_path):
+        name = os.path.abspath(str(unreal.PackageTools.package_name_to_filename(
+            wbp_path.split(".", 1)[0], extension=".uasset")))
+        if not os.path.isfile(name):
+            raise RuntimeError("cannot resolve the asset file: %s" % name)
+        return name
+
+    def list_event_bindings(wbp_path):
+        """[{event, widget, delegate, field, value}] for every MVVM event.
+
+        `value` is the binding's "Param 0" -- the argument this button passes to
+        the Verse event -- as text, or None when the event field takes none.
+        """
+        pkg = _Package(_wbp_file(wbp_path))
+        return [{"event": export["name"],
+                 "widget": _read_slot(pkg, slots["widget"]),
+                 "delegate": _read_slot(pkg, slots["delegate"]),
+                 "field": _read_slot(pkg, slots["field"]),
+                 "value": _read_param_value(pkg, slots)}
+                for export, slots in _package_events(pkg)]
+
+    def _save_regenerating_tags(wbp_path):
+        """Save the asset AND rebuild its asset-registry tags.
+
+        EditorAssetLibrary.save_asset does NOT regenerate the VerseClassFields
+        tag, so a freshly created Verse field is written out as a plain BP
+        variable (the live editor still shows it — only the FILE is missing it).
+        save_packages goes through the full save path, which rebuilds the tags.
+        """
+        asset = _el.load_asset(wbp_path)
+        if asset is None:
+            return
+        package = _el.get_package_for_object(asset)
+        package.modify()          # dirty it, or the save is skipped as a no-op
+        unreal.EditorLoadingAndSavingUtils.save_packages([package], False)
+        _await_unlocked(_wbp_file(wbp_path))
+
+    def _await_unlocked(path, tries=50):
+        """Block until the engine releases the file's handle.
+
+        save_packages returns before Windows closes the handle it wrote through,
+        so the byte patcher intermittently gets PermissionError. Only opening
+        for writing is a meaningful test (os.access says writable throughout).
+        """
+        for _ in range(tries):
+            try:
+                with open(path, "r+b"):
+                    return True
+            except PermissionError:
+                time.sleep(0.05)
+        return False
+
+    def _unload(wbp_path):
+        """Close and unload the asset so its file is ours to rewrite.
+
+        A field created this session has its MetaDataArray pointing at one of OUR
+        ctypes buffers, and unloading would FMemory::Free() memory the engine never
+        allocated (access violation at the next GC) -- so the arrays are nulled
+        first. That dirties the package, and unload_packages flushes it, so this
+        DOES write emptied metadata over the file; callers snapshot first and patch
+        the snapshot. Do not "fix" it by skipping the detach: the crash is real.
+        """
+        asset = _el.load_asset(wbp_path)
+        if asset is None:
+            return
+
+        # Detach EVERY variable's array: nulling an engine-owned one is harmless
+        # (the snapshot rewrites the file), missing one of ours is fatal.
+        try:
+            _detach_metadata_arrays(
+                asset, wbp_path,
+                [str(n) for n in _bel.list_member_variable_names(asset)])
+        except Exception:
+            pass    # no member variables -> nothing to detach
+
+        # Close the tab -- not because it locks the file (it does not), but because
+        # unload_packages leaves the package RESIDENT while a tab references it,
+        # and _reload then hands back the stale object. The returned count is the
+        # only way to learn a tab was open; remember it for _reopen_editor.
+        closed = unreal.get_editor_subsystem(
+            unreal.AssetEditorSubsystem).close_all_editors_for_asset(asset)
+        _WAS_EDITOR_OPEN[wbp_path] = bool(closed)
+
+        package = _el.get_package_for_object(asset)
+        del asset
+        unreal.EditorLoadingAndSavingUtils.unload_packages([package])
+        unreal.SystemLibrary.collect_garbage()
+        # The unload also flushes, and that write's handle outlives the call.
+        _await_unlocked(_wbp_file(wbp_path))
+
+    def _reload(wbp_path):
+        """Force a re-read of the patched file, compile, and save.
+
+        unload_packages does not always evict the package; a plain load_asset
+        would hand back the stale in-memory object (metadata arrays just
+        detached) and the compile+save would write that emptiness over the
+        freshly patched file. reload_packages forces the disk read; the full
+        save then rewrites the asset-registry tags.
+        """
+        package = unreal.find_package(wbp_path.split(".", 1)[0])
+        if package is not None:
+            unreal.EditorLoadingAndSavingUtils.reload_packages([package])
+
+        asset = _el.load_asset(wbp_path)
+        if asset is None:
+            raise RuntimeError("the widget did not reload after patching")
+        _bel.compile_blueprint(asset)
+        _save_regenerating_tags(wbp_path)
+        _reopen_editor(wbp_path)
+
+    def _close_editor(wbp_path):
+        """Close the tab and note that it WAS open, for the ops that are about to
+        close it anyway (an event-field create compiles, which tears it down).
+        Once the engine has destroyed the tab there is nothing left to detect."""
+        asset = _el.load_asset(wbp_path)
+        if asset is None:
+            return
+        if unreal.get_editor_subsystem(
+                unreal.AssetEditorSubsystem).close_all_editors_for_asset(asset):
+            _WAS_EDITOR_OPEN[wbp_path] = True
+
+    def _reopen_editor(wbp_path):
+        """Reopen the tab only if something actually closed it. Most operations
+        do not (measured: of create/delete/set-category, only an EVENT create),
+        and reopening an already-open tab cost ~0.44s and raised UEFN for nothing.
+
+        Declines while an op is in flight, LEAVING the state for the outer guard --
+        popping it here would lose the fact that the tab needs restoring.
+        """
+        if _EDITOR_REOPEN_HELD[0]:
+            return
+        if not _WAS_EDITOR_OPEN.pop(wbp_path, False):
+            return
+        asset = _el.load_asset(wbp_path)
+        if asset is not None:
+            unreal.get_editor_subsystem(
+                unreal.AssetEditorSubsystem).open_editor_for_assets([asset])
+
+    def _patch_on_disk(wbp_path, patch, prepare=None):
+        """Snapshot the file, unload, run patch(pkg) on the snapshot, write it
+        over the live file and reload. On failure -- or when patch returns falsy
+        (nothing changed) -- the snapshot is restored. Returns the backup path.
+
+        `prepare()` runs while the asset is still LOADED (it needs the engine API,
+        e.g. seeding an event); running it after the unload would re-lock the file
+        pkg.save is about to write. Its return value is passed to patch(pkg, prep).
+
+        Two copies, because prepare() may MUTATE the asset: `backup` (pre-prepare)
+        is the rollback target, so a failure also undoes a half-done seed;
+        `working` (post-prepare) is what gets patched, so the patcher sees the
+        seeded export. Patching the backup instead silently misses it.
+
+        Both must precede the unload: _unload's metadata detach dirties the
+        package and unload_packages flushes it, writing emptied metadata over the
+        file (Verse fields silently demoted to plain BP variables).
+        """
+        source = _wbp_file(wbp_path)
+        backup_dir = os.path.join(unreal.Paths.project_saved_dir(),
+                                  "VerseBinderBackups")
+        os.makedirs(backup_dir, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(source))[0]
+        tag = uuid.uuid4().hex[:8]
+        backup = os.path.join(backup_dir, "%s_%s.uasset" % (stem, tag))
+        working = os.path.join(backup_dir, "%s_%s_work.uasset" % (stem, tag))
+
+        _save_regenerating_tags(wbp_path)
+        shutil.copy2(source, backup)
+
+        try:
+            if prepare is None:
+                # Nothing touched the asset since the backup, so it IS the working
+                # copy -- copying beats re-saving (~0.2s for identical bytes).
+                prepared = None
+                shutil.copy2(backup, working)
+            else:
+                prepared = prepare()
+                # Re-snapshot: prepare() may have mutated the asset.
+                _save_regenerating_tags(wbp_path)
+                shutil.copy2(source, working)
+        except Exception:
+            shutil.copy2(backup, source)
+            _reload(wbp_path)
+            raise
+
+        _unload(wbp_path)
+        try:
+            pkg = _Package(working)
+            if patch(pkg, prepared):
+                pkg.save(source)
+            else:
+                # Nothing patched — restore the pre-prepare snapshot: the unload
+                # flushed emptied metadata over the live file, and an unused seed
+                # must not survive either.
+                shutil.copy2(backup, source)
+            _reload(wbp_path)
+            return backup
+        except Exception:
+            shutil.copy2(backup, source)
+            _reload(wbp_path)
+            raise
+
+    @_keeps_editor_open
+    def retarget_event_bindings(wbp_path, changes):
+        """Repoint existing events. `changes` = [(event_name, widget, field)]."""
+        result = {"retargeted": [], "skipped": [], "backup": None}
+        if not changes:
+            return result
+
+        def patch(pkg, _prepared):
+            # Names must exist before any slot offset is located: adding one
+            # grows the name map and shifts the whole file.
+            for _event, widget, field in changes:
+                pkg.add_name(widget)
+                pkg.add_name(field)
+            slots_by_event = {e["name"]: s for e, s in _package_events(pkg)}
+            for event, widget, field in changes:
+                slots = slots_by_event.get(event)
+                if slots is None:
+                    result["skipped"].append((event, "no such event"))
+                    continue
+                pkg.set_fname(slots["widget"], widget)
+                pkg.set_fname(slots["field"], field)
+                result["retargeted"].append((event, widget, field))
+            return bool(result["retargeted"])
+
+        result["backup"] = _patch_on_disk(wbp_path, patch)
+        return result
+
+    def _register_view_event(pkg, export_index):
+        """Add export number `export_index` to MVVMBlueprintView's Events array.
+
+        An event export the view does not list is invisible: the package loads,
+        but the editor shows the original bindings and nothing else.
+        """
+        # "Events" occurs in more than one export (MVVMBlueprintView holds the
+        # editable list, MVVMViewClass a compiled one), so the owner must be
+        # named rather than found by scanning — growing the wrong export's
+        # SerialSize corrupts an unrelated one and the engine asserts on load.
+        view = next((e for e in pkg.exports
+                     if str(e["name"] or "").startswith("MVVMBlueprintView_")),
+                    None)
+        if view is None:
+            raise RuntimeError("the widget has no MVVMBlueprintView export")
+
+        tags = pkg.find_fname(view, "Events")
+        if not tags:
+            raise RuntimeError("MVVMBlueprintView has no Events array")
+
+        at = tags[0] + _ARRAY_COUNT_GAP
+        body_end = view["offset"] + view["size"]
+        if not view["offset"] <= at < body_end:
+            raise RuntimeError("Events array is not inside the view's body")
+
+        count = struct.unpack_from("<i", pkg.data, at)[0]
+        end = at + 4 + count * 4
+        if not view["offset"] < end <= body_end:
+            raise RuntimeError("Events array overruns the view's body")
+
+        # The property tag records its payload's byte size just ahead of the
+        # GUID flag and element count. The engine sizes its read from it, so it
+        # has to grow with the array or the loader stops one element short.
+        size_at = at - 5
+        size = struct.unpack_from("<i", pkg.data, size_at)[0]
+        if size != 4 + count * 4:
+            raise RuntimeError(
+                "Events tag size %d does not match %d elements" % (size, count))
+
+        struct.pack_into("<i", pkg.data, at, count + 1)
+        struct.pack_into("<i", pkg.data, size_at, size + 4)
+        struct.pack_into("<q", pkg.data, view["entry"] + 28, view["size"] + 4)
+        pkg._shift_offsets(end, 4)
+        pkg.data[end:end] = struct.pack("<i", export_index)
+        pkg._reparse()
+
+    def _event_addition(addition):
+        """(widget, field[, delegate[, value]])
+        -> (widget, field, delegate or None, value or None).
+
+        `value` is the argument the button passes to a parameterised event --
+        the MVVM panel's "Param 0" box -- as text ("7", "2.5", "true").
+        """
+        return (addition[0], addition[1],
+                addition[2] if len(addition) > 2 else None,
+                addition[3] if len(addition) > 3 else None)
+
+    def _retarget_event_in_package(pkg, event_name, widget, field, delegate,
+                                   declaring_class=None, graph=None):
+        """Point an existing event export at (widget, field, delegate).
+
+        `declaring_class` -- the class DECLARING `delegate` -- goes into EventPath's
+        MemberParent, and matters when the event moves across button TYPES (a
+        Custom Button's OnButtonClicked does not exist on CommonButtonBase, so a
+        stale parent yields "<None>"). It must already be an import; it always is.
+
+        Intern every name BEFORE reading any slot offset: add_name grows the name
+        map and shifts every byte offset in the file.
+        """
+        for text in (graph, widget, field, delegate):
+            if text:
+                pkg.add_name(text)
+
+        slots = next(s for e, s in _package_events(pkg) if e["name"] == event_name)
+        pkg.set_fname(slots["widget"], widget)
+        pkg.set_fname(slots["field"], field)
+        if delegate:
+            pkg.set_fname(slots["delegate"], delegate)
+        if graph:
+            pkg.set_fname(slots["graph"], graph)
+
+        if declaring_class and "parent" in slots:
+            index = pkg.imports.get(declaring_class)
+            if index is None:
+                raise RuntimeError(
+                    "%s is not in the import table, so the delegate's MemberParent "
+                    "cannot be retargeted" % declaring_class)
+            struct.pack_into("<i", pkg.data, slots["parent"], index)
+
+    def _clone_event_in_package(pkg, template_name, widget, field, delegate,
+                                declaring_class=None):
+        """Clone the event export `template_name` and retarget the copy.
+
+        Returns the clone's export name. The event key is never serialized —
+        the engine derives it on load — so the clone gets its own on the next
+        compile with nothing to forge. Each clone also needs its OWN GraphName;
+        keeping the template's would collide with it.
+        """
+        graph = "__" + str(uuid.uuid4())
+        pkg.add_name(graph)
+
+        base, _number = _split_fname(template_name)
+        used = {e["name"] for e in pkg.exports}
+        number = 0
+        while "%s_%d" % (base, number) in used:
+            number += 1
+        name = "%s_%d" % (base, number)
+
+        template = next(e for e in pkg.exports if e["name"] == template_name)
+        pkg.clone_export(template, name)
+
+        index = next(i for i, e in enumerate(pkg.exports, start=1)
+                     if e["name"] == name)
+        _register_view_event(pkg, index)
+
+        _retarget_event_in_package(pkg, name, widget, field, delegate,
+                                   declaring_class, graph=graph)
+        return name
+
+    # The placeholder target the seed event is created against. It never has to
+    # resolve -- the patcher retargets every FName before the engine sees the
+    # file -- it only has to make the engine SERIALIZE the path structs.
+    _SEED_WIDGET = "__VerseBinderSeedWidget"
+    _SEED_FIELD = "__VerseBinderSeedField"
+    _SEED_DELEGATE = "OnButtonBaseClicked"
+    _SEED_PARENT = "/Script/CoreUObject.Class'/Script/CommonUI.CommonButtonBase'"
+
+    _SEED_EVENT_PATH = (
+        '(Paths=((BindingReference=(MemberParent="%s",MemberName="%s"),'
+        'BindingKind=Property)),WidgetName="%s",'
+        'ContextId=00000000000000000000000000000000,Source=Widget,'
+        'bIsComponent=False,bDeprecatedSource=True)'
+        % (_SEED_PARENT, _SEED_DELEGATE, _SEED_WIDGET))
+
+    _SEED_DEST_PATH = (
+        '(Paths=((BindingReference=(MemberName="%s",MemberGuid=%s,'
+        'bSelfContext=True))),WidgetName="",'
+        'ContextId=00000000000000000000000000000000,Source=SelfContext,'
+        'bIsComponent=False,bDeprecatedSource=True)' % (_SEED_FIELD, "0" * 32))
+
+    def _seed_first_event(wbp_path):
+        """Give a widget with NO events a template to clone, using the engine, so
+        the user need not hand-author the first one. MVVMEditorSubsystem.add_event
+        does the structural work -- appends a real export AND registers it in the
+        view's Events array (a virgin view omits Events entirely, leaving the
+        patcher no array to grow).
+
+        The shell is not quite a template: EventPath and DestinationPath serialize
+        (import_text bypasses their read-only guard), but GraphName has no such
+        door, stays None, and an unset FName is not written at all.
+        _finish_seed_event injects that one tag on disk.
+        """
+        wbp = _el.load_asset(wbp_path)
+        subsystem = unreal.get_editor_subsystem(unreal.MVVMEditorSubsystem)
+        view = subsystem.get_view(wbp) or subsystem.request_view(wbp)
+        before = {e.get_name() for e in view.get_editor_property("events")}
+
+        event = subsystem.add_event(wbp)
+        if event is None:
+            raise RuntimeError("MVVMEditorSubsystem.add_event returned nothing")
+
+        # get_editor_property on a UObject hands back the LIVE struct, so
+        # import_text edits the event itself -- no (refused) set_editor_property.
+        event.get_editor_property("event_path").import_text(_SEED_EVENT_PATH)
+        event.get_editor_property("destination_path").import_text(_SEED_DEST_PATH)
+
+        _bel.compile_blueprint(wbp)
+        _save_regenerating_tags(wbp_path)
+
+        after = [e.get_name() for e in view.get_editor_property("events")]
+        new = [n for n in after if n not in before]
+        if not new:
+            raise RuntimeError("the seed event did not persist")
+        return new[0]
+
+    # A GraphName NameProperty tag: [FName name][FName "NameProperty"]
+    # [int32 ArrayIndex][int32 value size = 8][byte flags][FName value] = 33 bytes.
+    _GRAPH_TAG_SIZE = 33
+
+    def _finish_seed_event(pkg, event_name, graph):
+        """Write the GraphName tag the engine's seed shell leaves out.
+
+        A property at its default is never serialized, and graph_name is
+        read-only, so the shell's stream simply ends where GraphName belongs. It
+        terminates with an FName "None" followed by a 4-byte trailer; writing the
+        tag AT that terminator extends the stream and leaves None terminating it,
+        which puts GraphName at exactly the offset a real event carries it.
+        """
+        pkg.add_name("GraphName")
+        pkg.add_name("NameProperty")
+        base, number = _split_fname(graph)
+        pkg.add_name(base)
+
+        export = next(e for e in pkg.exports if e["name"] == event_name)
+        end = export["offset"] + export["size"]
+        ends = [n for n in sorted(pkg.find_fname(export, "None"))
+                if n + 8 + 4 == end]
+        if not ends:
+            raise RuntimeError("the seed event's property stream has no terminator")
+        at = ends[-1]
+
+        tag = (struct.pack("<ii", pkg.name_index["GraphName"], 0)
+               + struct.pack("<ii", pkg.name_index["NameProperty"], 0)
+               + struct.pack("<ii", 0, 8) + bytes([0])
+               + struct.pack("<ii", pkg.name_index[base], number))
+        if len(tag) != _GRAPH_TAG_SIZE:
+            raise RuntimeError("built a %d-byte GraphName tag" % len(tag))
+
+        struct.pack_into("<q", pkg.data, export["entry"] + 28,
+                         export["size"] + len(tag))
+        pkg._shift_offsets(at, len(tag))
+        pkg.data[at:at] = tag
+        pkg._reparse()
+
+    def _pick_template(pkg, param, params):
+        """(event name, its delegate) to clone for a field taking `param`.
+
+        A clone copies its template's GRAPH, which for a parameterised binding is
+        TYPED -- and the engine trusts that graph over the FName the patcher
+        wrote. Cloning an int binding onto a float field silently re-points the
+        field back to the int one (measured). So the donor's param must MATCH, and
+        a plain event is always safe: its graph carries no parameter, and _add_pin
+        builds the pin the clone then lacks.
+        """
+        events = _package_events(pkg)
+
+        if param:
+            for export, slots in events:      # same-typed: graph already agrees
+                if params.get(_read_slot(pkg, slots["field"])) == param:
+                    return export["name"], _read_slot(pkg, slots["delegate"])
+
+        for export, slots in events:          # parameterless: no typed graph
+            if "param_value" not in slots:
+                return export["name"], _read_slot(pkg, slots["delegate"])
+
+        # Only differently-typed param bindings exist; _apply_param_value will
+        # strip the inherited pin and rebuild it.
+        if events:
+            export, slots = events[0]
+            return export["name"], _read_slot(pkg, slots["delegate"])
+        return None, None
+
+    def _build_pin_block(pkg, value):
+        """Serialize a SavedPins block holding `value`, for THIS package: every
+        FName is resolved through the package's own name map (adding any it
+        lacks), since the template stores indices, not text.
+
+        Adding names REPARSES the package, so callers must re-locate any offset
+        they took before calling this.
+        """
+        ops = []
+        for token in _PIN_TEMPLATE.split():
+            if re.fullmatch(r"[0-9a-f]+", token) and not len(token) % 2:
+                ops.append(("raw", bytes.fromhex(token)))
+            else:
+                base, _, number = token.partition("#")
+                pkg.add_name(base)
+                ops.append(("name", base, int(number or 0)))
+
+        block = bytearray()
+        default_at = None
+        for op in ops:
+            if op[0] == "raw":
+                block += op[1]
+                continue
+            if op[1] == "DefaultString":
+                default_at = len(block)      # the tag; its size sits at +20
+            block += struct.pack("<ii", pkg.name_index[op[1]], op[2])
+        if default_at is None:
+            raise RuntimeError("the pin template has no DefaultString tag")
+
+        # Rewrite the template's baked-in value, resizing the string, its tag and
+        # the enclosing array (the export's SerialSize is the caller's job).
+        old = pkg.encode_fstring(_PIN_TEMPLATE_VALUE)
+        new = pkg.encode_fstring(str(value))
+        delta = len(new) - len(old)
+        value_at = default_at + _NAME_VALUE_GAP
+        if bytes(block[value_at:value_at + len(old)]) != old:
+            raise RuntimeError("the pin template's value is not where expected")
+
+        size_at = default_at + _PROPERTY_SIZE_FIELD
+        struct.pack_into("<i", block, size_at,
+                         struct.unpack_from("<i", block, size_at)[0] + delta)
+        struct.pack_into("<i", block, _ARRAY_SIZE_FIELD,
+                         struct.unpack_from("<i", block,
+                                            _ARRAY_SIZE_FIELD)[0] + delta)
+        block[value_at:value_at + len(old)] = new
+        return bytes(block)
+
+    def _add_pin(pkg, event_name, value):
+        """Give a pinless event export a SavedPins block holding `value`. It goes
+        immediately BEFORE GraphName -- a property stream is order-sensitive, and
+        that is where the engine writes it."""
+        block = _build_pin_block(pkg, value)      # adds names -> shifts offsets
+
+        # Re-locate AFTER _build_pin_block: add_name reparsed the package.
+        export = next(e for e in pkg.exports if e["name"] == event_name)
+        if pkg.find_tag(export, _PIN_ARRAY_TAG) is not None:
+            raise RuntimeError("%s already has a pin" % event_name)
+        graph = pkg.find_tag(export, "GraphName")
+        if graph is None:
+            raise RuntimeError("%s has no GraphName to insert the pin before"
+                               % event_name)
+
+        struct.pack_into("<q", pkg.data, export["entry"] + 28,
+                         export["size"] + len(block))
+        pkg._shift_offsets(graph, len(block))
+        pkg.data[graph:graph] = block
+        pkg._reparse()
+
+    def _remove_pin(pkg, event_name):
+        """Strip a SavedPins block from an event that must not have one: a clone of
+        a parameterised binding onto a PLAIN field inherits a pin the field cannot
+        accept."""
+        export = next(e for e in pkg.exports if e["name"] == event_name)
+        start = pkg.find_tag(export, _PIN_ARRAY_TAG)
+        if start is None:
+            return
+        end = pkg.find_tag(export, "GraphName")
+        if end is None or end <= start:
+            raise RuntimeError("%s: cannot bound the pin block" % event_name)
+
+        size = end - start
+        struct.pack_into("<q", pkg.data, export["entry"] + 28,
+                         export["size"] - size)
+        del pkg.data[start:end]
+        pkg._shift_offsets(start, -size)
+        pkg._reparse()
+
+    def _apply_param_value(pkg, event_name, field, value, params):
+        """Reconcile the clone's inherited pin with its FIELD (build one, or strip
+        it), then write "Param 0". Returns True if the pin had to be BUILT.
+
+        The value is always written, even when the caller gave none: the inherited
+        one belongs to a different button.
+
+        A value in a CLONED pin survives the create's compile; one in a pin we
+        SYNTHESIZED does not (the compiler regenerates it from the field). Only
+        the caller can fix that, with a second pass -- hence the return value.
+        """
+        param = params.get(field)
+        export = next(e for e in pkg.exports if e["name"] == event_name)
+        has_pin = pkg.find_tag(export, _PIN_ARRAY_TAG) is not None
+
+        if not param:
+            if has_pin:
+                _remove_pin(pkg, event_name)
+            return False
+
+        if value is None:
+            value = _EVENT_PARAM_DEFAULTS[param]
+        if has_pin:
+            _set_param_value(pkg, event_name, str(value))
+            return False
+        _add_pin(pkg, event_name, str(value))
+        return True
+
+    @_keeps_editor_open
+    def create_event_bindings(wbp_path, additions):
+        """Create new events. `additions` = [(widget, field[, delegate])];
+        a missing delegate keeps the template's.
+
+        Each event is a CLONE of an existing one. A widget with none gets a
+        template first, built by the engine (_seed_first_event) and completed on
+        disk, so this works on a widget that has never had an event binding.
+        Patched via _patch_on_disk (backup restored on failure).
+        """
+        # `_values` pairs each created event with the value it is owed, for the
+        # second pass below; it is popped before returning, so the result shape
+        # callers see is unchanged.
+        result = {"created": [], "skipped": [], "backup": None, "_values": []}
+        if not additions:
+            result.pop("_values")
+            return result
+
+        def prepare():
+            # Runs with the asset loaded, inside _patch_on_disk's rollback: both
+            # calls need the engine API / the widget tree, and seeding WRITES a
+            # placeholder event, so a failure after this point must undo it.
+            declaring = _delegate_declaring_classes(wbp_path)
+
+            # field -> parameter kind (int/float/logic) or None, read from the
+            # engine's own VerseClassFields tag rather than the caller's belief.
+            params = {f["name"]: f.get("param") for f in list_verse_fields(wbp_path)}
+
+            # Refuse a delegate the widget does not declare, BEFORE writing
+            # anything: the two button shapes spell the same event differently
+            # (OnButtonCTAHighlight vs OnButtonHighlight), and a mismatch compiles
+            # to an unresolvable "<None>" delegate with only a log warning.
+            for addition in additions:
+                widget, field, delegate, value = _event_addition(addition)
+                if delegate and (widget, delegate) not in declaring:
+                    known = sorted(d for w, d in declaring if w == widget)
+                    raise RuntimeError(
+                        "%s does not declare %s -- it has %s"
+                        % (widget, delegate, ", ".join(known) or "no events"))
+                # A value needs a pin to hold it, and the FIELD decides whether
+                # there is one. Catch it here, before anything is written.
+                if value is not None and not params.get(field):
+                    raise RuntimeError(
+                        "%s takes no parameter, so %s cannot pass it a value"
+                        % (field, widget))
+
+            seed = (None if list_event_bindings(wbp_path)
+                    else _seed_first_event(wbp_path))
+            return seed, declaring, params
+
+        def patch(pkg, prepared):
+            seed, declaring, params = prepared
+            pending = list(additions)
+
+            if seed is not None:
+                # The seed is a shell until its GraphName tag exists; without it
+                # _package_events skips the export and there is still no template.
+                _finish_seed_event(pkg, seed, "__" + str(uuid.uuid4()))
+                # It points at a placeholder, so it is not a binding yet -- it is
+                # the FIRST one, unfilled. Retarget it in place rather than cloning
+                # and deleting it: no export is ever removed (shrinking the export
+                # table is a whole class of surgery avoided).
+                widget, field, delegate, value = _event_addition(pending.pop(0))
+                _retarget_event_in_package(
+                    pkg, seed, widget, field, delegate or _SEED_DELEGATE,
+                    declaring.get((widget, delegate or _SEED_DELEGATE)))
+                built = _apply_param_value(pkg, seed, field, value, params)
+                result["created"].append((seed, widget, field))
+                if built:
+                    result["_values"].append(
+                        (seed, value if value is not None
+                         else _EVENT_PARAM_DEFAULTS[params[field]]))
+
+            for addition in pending:
+                widget, field, delegate, value = _event_addition(addition)
+
+                # The donor's parameter must match the field's: its GRAPH is typed
+                # and the engine trusts that over the patched FName. A plain event
+                # is always safe -- _apply_param_value builds the pin it lacks.
+                template, template_delegate = _pick_template(
+                    pkg, params.get(field), params)
+                if template is None:
+                    raise RuntimeError("could not establish an event to clone")
+
+                # Declaring class is per (widget, delegate); with no delegate
+                # given the clone keeps the template's, so resolve against it.
+                name = _clone_event_in_package(
+                    pkg, template, widget, field, delegate,
+                    declaring_class=declaring.get(
+                        (widget, delegate or template_delegate)))
+                built = _apply_param_value(pkg, name, field, value, params)
+                result["created"].append((name, widget, field))
+                if built:
+                    result["_values"].append(
+                        (name, value if value is not None
+                         else _EVENT_PARAM_DEFAULTS[params[field]]))
+            return True
+
+        result["backup"] = _patch_on_disk(wbp_path, patch, prepare=prepare)
+
+        # SECOND PASS -- only for values in pins we SYNTHESIZED, whose compile
+        # would otherwise revert them. A cloned pin's value already stuck, and an
+        # editor cycle costs ~2s and closes the tab, so it is skipped when it can
+        # be (the common case: a donor binding exists).
+        valued = result.pop("_values")
+        if valued:
+            def set_values(pkg, _prepared):
+                # A create that rolled back leaves `valued` naming exports the
+                # restored file no longer has.
+                live = {e["name"] for e, _s in _package_events(pkg)}
+                wrote = False
+                for name, value in valued:
+                    if name in live:
+                        _set_param_value(pkg, name, str(value))
+                        wrote = True
+                return wrote
+            _patch_on_disk(wbp_path, set_values)
+
+        return result
+
+    @_keeps_editor_open
+    def remove_event_bindings(wbp_path, event_names):
+        """Delete MVVM events by export name. Uses the engine API, not the disk."""
+        wbp = _el.load_asset(wbp_path)
+        subsystem = unreal.get_editor_subsystem(unreal.MVVMEditorSubsystem)
+        view = subsystem.get_view(wbp)
+        if view is None:
+            return 0
+        doomed, removed = set(event_names), 0
+        for event in list(view.get_editor_property("events")):
+            if event.get_name() in doomed:
+                subsystem.remove_event(wbp, event)
+                removed += 1
+        if removed:
+            _bel.compile_blueprint(wbp)
+            _el.save_asset(wbp_path)
+        return removed
+
     def _split_pattern(pattern):
         """Split a name pattern around its `#` (or `{n}`) placeholder -> (pre, post).
 
@@ -876,15 +2586,19 @@ if not _needs_restart:
     def detect_patterns(names):
         """Auto-detect numbered families: ["Slot1","Slot2","Img"] -> [("Slot#", 2)].
 
-        Only names with exactly ONE digit run participate — a second run would
-        yield a pattern the matchers treat as literal text. A family needs at
-        least two members to count. Sorted largest-family first.
+        The LAST digit run is the index, and only it becomes `#`: UMG names a
+        duplicated widget family Slot1_1, Slot1_2, ... so requiring a single digit run
+        would skip exactly the case bulk binding exists for. Earlier runs stay literal,
+        which is what the matchers expect. A family needs at least two members. Sorted
+        largest-family first.
         """
         groups = {}
         for name in names:
-            if len(re.findall(r"\d+", name)) != 1:
+            runs = list(re.finditer(r"\d+", name))
+            if not runs:
                 continue
-            pat = re.sub(r"\d+", "#", name)
+            last = runs[-1]
+            pat = name[:last.start()] + "#" + name[last.end():]
             groups[pat] = groups.get(pat, 0) + 1
         return sorted(((p, c) for p, c in groups.items() if c >= 2),
                       key=lambda pc: (-pc[1], pc[0]))
@@ -907,90 +2621,92 @@ if not _needs_restart:
                 out.setdefault(int(m.group(1)), []).append(item)
         return out
 
-    def match_by_suffix(fields, widgets, field_pattern, widget_pattern, prop_name):
-        """Pair fields with engine widgets by a shared index.
-
-        Patterns use `#` as the number placeholder ("VF_Color#" ↔ "Image#"); a bare
-        pattern is treated as prefix#. Type mismatches and unmatched indices are
-        reported, never silently dropped — a mismatch is usually a typo in a pattern.
-        Returns ([(field, widget, native, prop)], [warnings]).
-        """
-        fields_by_n = _index_by_pattern(fields, field_pattern)
-        widgets_by_n = _index_by_pattern(widgets, widget_pattern)
-
+    def _match_indexed(fields_by_n, targets_by_n, pair_fn, target_noun, field_noun):
+        """Shared core of the bulk matchers: walk the common indices, warn on
+        ambiguity and on unmatched indices (never silently drop — a mismatch is
+        usually a typo in a pattern). `pair_fn(field, target, warnings)` returns
+        a pair or None (after appending its own warning)."""
         pairs, warnings = [], []
-        for n in sorted(set(fields_by_n) & set(widgets_by_n)):
-            fs, ws = fields_by_n[n], widgets_by_n[n]
-            if len(fs) > 1 or len(ws) > 1:
+        for n in sorted(set(fields_by_n) & set(targets_by_n)):
+            fs, ts = fields_by_n[n], targets_by_n[n]
+            if len(fs) > 1 or len(ts) > 1:
                 warnings.append("index %d ambiguous: %s / %s"
-                                % (n, [f["name"] for f in fs], [w["name"] for w in ws]))
+                                % (n, [f["name"] for f in fs], [t["name"] for t in ts]))
                 continue
-            field, widget = fs[0], ws[0]
-            if not is_direct_bindable(field["type"], widget["native"], prop_name):
-                warnings.append("%s (%s) cannot bind directly to %s.%s — needs a conversion"
-                                % (field["name"], field["type"], widget["name"], prop_name))
-                continue
-            pairs.append((field["name"], widget["name"], widget["native"], prop_name))
-
-        for n in sorted(set(fields_by_n) - set(widgets_by_n)):
-            warnings.append("%s has no matching widget (index %d)"
-                            % (fields_by_n[n][0]["name"], n))
-        for n in sorted(set(widgets_by_n) - set(fields_by_n)):
-            warnings.append("%s has no matching field (index %d)"
-                            % (widgets_by_n[n][0]["name"], n))
+            pair = pair_fn(fs[0], ts[0], warnings)
+            if pair is not None:
+                pairs.append(pair)
+        for n in sorted(set(fields_by_n) - set(targets_by_n)):
+            warnings.append("%s has no matching %s (index %d)"
+                            % (fields_by_n[n][0]["name"], target_noun, n))
+        for n in sorted(set(targets_by_n) - set(fields_by_n)):
+            warnings.append("%s has no matching %s (index %d)"
+                            % (targets_by_n[n][0]["name"], field_noun, n))
         return pairs, warnings
+
+    def match_by_suffix(fields, widgets, field_pattern, widget_pattern, prop_name):
+        """Pair fields with engine widgets by a shared index ("VF_Color#" x
+        "Image#"). Returns ([(field, widget, native, prop)], [warnings])."""
+        def pair(field, widget, warnings):
+            if not is_direct_bindable(field["type"], widget["native"], prop_name):
+                warnings.append(
+                    "%s (%s) cannot bind directly to %s.%s — needs a conversion"
+                    % (field["name"], field["type"], widget["name"], prop_name))
+                return None
+            return (field["name"], widget["name"], widget["native"], prop_name)
+        return _match_indexed(_index_by_pattern(fields, field_pattern),
+                              _index_by_pattern(widgets, widget_pattern),
+                              pair, "widget", "field")
+
+    def match_events_by_suffix(fields, event_widgets, field_pattern, widget_pattern,
+                               delegate_label):
+        """Pair EVENT fields with buttons by a shared index ("VF_Click#" x
+        "Button#" x "On Clicked"). Returns ([(field, widget, delegate)], [warnings])."""
+        def pair(field, widget, warnings):
+            # The same event is spelled differently per button shape, so resolve
+            # the label against THIS widget's own delegates.
+            delegate = next((d for d, label in widget["delegates"]
+                             if label == delegate_label), None)
+            if delegate is None:
+                warnings.append("%s has no %s event" % (widget["name"], delegate_label))
+                return None
+            return (field["name"], widget["name"], delegate)
+        return _match_indexed(
+            _index_by_pattern([f for f in fields if f["type"] == "event"],
+                              field_pattern),
+            _index_by_pattern(event_widgets, widget_pattern),
+            pair, "widget", "event field")
 
     def match_child_by_suffix(fields, child_widgets, field_pattern, child_pattern,
                               child_field):
-        """Pair fields with sub-widget instances by a shared index.
-
-        `field_pattern` and `child_pattern` use `#` as the number placeholder, e.g.
-        "VF_Slot#Image" ↔ "Slot#" pairs VF_Slot1Image with Slot1, etc. Same-type
-        only: the parent field's type must equal the child field's type.
-        Returns ([child-pair dicts], [warnings]).
-        """
-        fields_by_n = _index_by_pattern(fields, field_pattern)
-        children_by_n = _index_by_pattern(child_widgets, child_pattern)
-
-        pairs, warnings = [], []
-        for n in sorted(set(fields_by_n) & set(children_by_n)):
-            fs, cs = fields_by_n[n], children_by_n[n]
-            if len(fs) > 1 or len(cs) > 1:
-                warnings.append("index %d ambiguous: %s / %s"
-                                % (n, [f["name"] for f in fs], [c["name"] for c in cs]))
-                continue
-            field, child = fs[0], cs[0]
+        """Pair fields with sub-widget instances by a shared index ("VF_Slot#Image"
+        x "Slot#"). Same-type only. Returns ([child-pair dicts], [warnings])."""
+        def pair(field, child, warnings):
             cf = next((f for f in child["fields"] if f["name"] == child_field), None)
             if cf is None:
                 warnings.append("%s has no field %s" % (child["name"], child_field))
-                continue
+                return None
             if field["type"] != cf["type"]:
                 warnings.append("%s (%s) ≠ %s.%s (%s) — types must match"
                                 % (field["name"], field["type"], child["name"],
                                    child_field, cf["type"]))
-                continue
-            pairs.append({"mode": "child", "field": field["name"],
-                          "widget": child["name"], "class_path": child["class_path"],
-                          "child_field": child_field})
-
-        for n in sorted(set(fields_by_n) - set(children_by_n)):
-            warnings.append("%s has no matching sub-widget (index %d)"
-                            % (fields_by_n[n][0]["name"], n))
-        for n in sorted(set(children_by_n) - set(fields_by_n)):
-            warnings.append("%s has no matching field (index %d)"
-                            % (children_by_n[n][0]["name"], n))
-        return pairs, warnings
+                return None
+            return {"mode": "child", "field": field["name"],
+                    "widget": child["name"], "class_path": child["class_path"],
+                    "child_field": child_field}
+        return _match_indexed(_index_by_pattern(fields, field_pattern),
+                              _index_by_pattern(child_widgets, child_pattern),
+                              pair, "sub-widget", "field")
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  FIELD CREATION  (memory-patched Verse metadata — see verse_field_tools.md)
+    #  FIELD CREATION  (memory-patched Verse metadata)
     # ═══════════════════════════════════════════════════════════════════════
     #
-    # UE exposes NO API for a variable's MetaDataArray. A Verse field is a normal
-    # BP member variable carrying 4 metadata keys (5 for `message`) plus
-    # PropertyFlags=65541. We create the variable via the public API, then patch
-    # only the metadata in memory. Nothing is hardcoded to a build: the
-    # NewVariables offset is located by probing for a known VarGuid, and FName key
-    # bytes are interned at runtime.
+    # UE exposes NO API for a variable's MetaDataArray. A Verse field is a
+    # normal BP member variable carrying 4 metadata keys (5 for `message`) plus
+    # PropertyFlags=65541; the variable is created via the public API, then the
+    # metadata is patched in memory. Nothing is build-hardcoded: NewVariables is
+    # located by probing for a known VarGuid, FName keys interned at runtime.
 
     _DESC_SIZE = 232
     _GUID_OFFSET = 12
@@ -998,6 +2714,7 @@ if not _needs_restart:
     _METADATA_OFFSET = 200
     _ENTRY_SIZE = 32
     _VERSE_PROPERTY_FLAGS = 65541
+    _VERSE_EVENT_PROPERTY_FLAGS = 65557
     _NEWVARS_SEARCH_LIMIT = 1400
 
     _COLOR_STRUCT = ("/Script/CoreUObject.VerseStruct"
@@ -1005,22 +2722,55 @@ if not _needs_restart:
     _COLOR_ALPHA_STRUCT = ("/Script/CoreUObject.VerseStruct"
                            "'/VerseColors/_Verse/VNI/VerseColors.Colors_color_alpha'")
 
-    _CREATE_TYPES = ("logic", "int", "float", "string", "message",
+    _VERSE_EVENT_CLASS = ("/Script/CoreUObject.Class"
+                          "'/Script/VerseTypeEditorRuntime.VerseEvent'")
+    _VERSE_UI_WIDGET_CLASS = ("/Script/CoreUObject.Class"
+                              "'/Script/VerseUI.VerseUIUserWidget'")
+
+    _CREATE_TYPES = ("logic", "int", "float", "string", "message", "event",
                      "color", "color_alpha", "material", "texture")
 
-    # ctypes buffers must outlive serialization or Unreal reads dangling pointers.
+    # An event field may carry ONE parameter -- not a different kind of field (same
+    # VerseEvent member, flags and keys), just a serialized EdGraphPinType in the
+    # EventParameters value a plain event leaves empty. Spelled ("event", param)
+    # rather than an "event_int" kind so every `kind == "event"` test keeps holding.
+    _EVENT_PARAM_PINS = {
+        "int": ('(PinCategory="int64",PinSubCategoryMemberReference='
+                '(MemberGuid=%s),PinValueType=())' % _ZERO_GUID),
+        "float": ('(PinCategory="real",PinSubCategory="double",'
+                  'PinSubCategoryMemberReference=(MemberGuid=%s),'
+                  'PinValueType=())' % _ZERO_GUID),
+        "logic": ('(PinCategory="bool",PinSubCategoryMemberReference='
+                  '(MemberGuid=%s),PinValueType=())' % _ZERO_GUID),
+    }
+    _EVENT_PARAMS = tuple(_EVENT_PARAM_PINS)
+
+    def _field_spec(field):
+        """(name, kind[, param]) -> (name, kind, param or None)."""
+        return (field[0], field[1], field[2] if len(field) > 2 else None)
+
+    # What the Create tab's type dropdown offers. A parameterised event is shown
+    # as its own entry rather than behind a second "param" combo, so a row stays
+    # (name, kind) and the pattern/bulk path needs no special case. The variants
+    # sit directly after plain `event` so the whole event family reads together.
+    _CREATE_LABELS = tuple(
+        label
+        for kind in _CREATE_TYPES
+        for label in ([kind] + (["event (%s)" % p for p in _EVENT_PARAMS]
+                                if kind == "event" else [])))
+
+    def _split_create_label(label):
+        """"event (int)" -> ("event", "int");  "color" -> ("color", None)."""
+        match = re.match(r'^event \((\w+)\)$', label)
+        return ("event", match.group(1)) if match else (label, None)
+
+    # ctypes buffers must outlive serialization or Unreal reads dangling
+    # pointers. _unload and delete_verse_fields detach descriptor arrays before
+    # the engine can destroy one — nulling an engine-owned array is harmless;
+    # being wrong the other way costs the whole editor.
     if not hasattr(unreal, "_verse_field_buffers"):
         unreal._verse_field_buffers = []
     _KEEP = unreal._verse_field_buffers
-
-    # (wbp_path, name) of fields memory-patch-created THIS editor session — their
-    # MetaDataArray points at our ctypes buffers. delete_verse_fields detaches those
-    # pointers before removal (see _detach_metadata_arrays), so deletion is safe; this
-    # set is just bookkeeping. Stored on the unreal module so it survives re-running
-    # this file in a fresh namespace.
-    if not hasattr(unreal, "_verse_fields_created_this_session"):
-        unreal._verse_fields_created_this_session = set()
-    _CREATED_THIS_SESSION = unreal._verse_fields_created_this_session
 
     def _pin_type(kind):
         """Friendly Verse type name -> EdGraphPinType."""
@@ -1038,7 +2788,9 @@ if not _needs_restart:
                 raise RuntimeError("basic type %r resolved to %r, expected %r"
                                    % (name, actual, expect))
             return pt
-        obj = {"color": ("struct", _COLOR_STRUCT),
+        obj = {"event": ("object", _VERSE_EVENT_CLASS),
+               "back_pointer": ("object", _VERSE_UI_WIDGET_CLASS),
+               "color": ("struct", _COLOR_STRUCT),
                "color_alpha": ("struct", _COLOR_ALPHA_STRUCT),
                "material": ("softobject", "/Script/CoreUObject.Class'/Script/Engine.MaterialInterface'"),
                "texture": ("softobject", "/Script/CoreUObject.Class'/Script/Engine.Texture2D'")}
@@ -1068,15 +2820,32 @@ if not _needs_restart:
         _KEEP.append(buf)
         return ctypes.addressof(buf), len(text) + 1
 
-    def _build_metadata_block(display_name, disable_default, visibility="<public>"):
-        entries = [
-            (_fname_key16("FieldNotify"), None),
-            (_fname_key16("VerseVariable"), None),
-            (_fname_key16("DisplayName"), display_name),
-            (_fname_key16("VisibilityAccess"), visibility),
-        ]
-        if disable_default:                        # `message` fields only
-            entries.append((_fname_key16("DisableDefaultValue"), None))
+    def _build_metadata_block(display_name, disable_default=False,
+                              visibility="<public>", event=False,
+                              hidden_only=False, event_param=None):
+        if hidden_only:                            # the shared BackPointer member
+            entries = [
+                (_fname_key16("DisplayName"), display_name),
+                (_fname_key16("Hidden"), None),
+            ]
+        else:
+            entries = [
+                (_fname_key16("FieldNotify"), None),
+                (_fname_key16("VerseVariable"), None),
+                (_fname_key16("DisplayName"), display_name),
+                (_fname_key16("VisibilityAccess"), visibility),
+            ]
+            if event:
+                # EventParameters holds a serialized EdGraphPinType, or nothing
+                # for a parameterless event. That single string is the whole
+                # difference between `event` and `event (int)`.
+                entries.extend([
+                    (_fname_key16("Hidden"), None),
+                    (_fname_key16("EventParameters"),
+                     _EVENT_PARAM_PINS[event_param] if event_param else None),
+                ])
+            elif disable_default:                  # `message` fields only
+                entries.append((_fname_key16("DisableDefaultValue"), None))
         block = ctypes.create_string_buffer(len(entries) * _ENTRY_SIZE)
         _KEEP.append(block)
         base = ctypes.addressof(block)
@@ -1103,28 +2872,94 @@ if not _needs_restart:
                 return data, count
         raise RuntimeError("NewVariables array not found — descriptor layout changed")
 
-    def create_verse_fields(wbp_path, fields, category=None):
-        """Create Verse fields. `fields` = [(name, kind)].
+    def _event_function_graph_status(wbp, public_name):
+        """(graph, has_function_entry) for a public Verse event function graph."""
+        graph = _bel.find_graph(wbp, public_name)
+        if graph is None:
+            return None, False
+        try:
+            editor = unreal.BlueprintGraphEditor.get_graph_editor_by_name(
+                wbp, public_name)
+            entries = editor.list_nodes_of_class(unreal.K2Node_FunctionEntry)
+            has_entry = any(node.get_name() == "K2Node_FunctionEntry_0"
+                            for node in entries)
+        except Exception:
+            has_entry = False
+        return graph, has_entry
 
-        Every created variable is patched into a real Verse field and verified
-        against the VerseClassFields tag. Raises if any field fails to materialize,
-        so a half-created plain BP variable never survives silently.
-        Returns {created, skipped_existing, verified}.
+    def _create_verse_fields_impl(wbp_path, fields, category=None):
+        """Create Verse fields. `fields` = [(name, kind)] or, for an event that
+        takes a parameter, [(name, "event", param)] where param is int/float/
+        logic. Every variable is patched into a real Verse field and verified
+        against VerseClassFields; raises if any fails, so a half-made plain BP
+        variable never survives. Returns {created, skipped_existing, verified}.
+
+        An `event` field is THREE things (credit: Benjamin Ferellec): a member
+        VerseFieldInternalVariable_<PublicName> typed VerseEvent, a public
+        function graph <PublicName>, and a shared hidden BackPointer member.
+        Flags 65557; metadata adds Hidden + EventParameters -- and a parameter
+        is nothing more than a pin type in that EventParameters value.
         """
-        for name, kind in fields:
+        fields = [_field_spec(f) for f in fields]
+        for name, kind, param in fields:
             _pin_type(kind)                        # validate all types up front
+            if param is not None:
+                if kind != "event":
+                    raise ValueError("only event fields take a parameter, not %r"
+                                     % kind)
+                if param not in _EVENT_PARAM_PINS:
+                    raise ValueError("unknown event parameter %r -- expected %s"
+                                     % (param, ", ".join(_EVENT_PARAMS)))
+            if kind == "event" and name.startswith("VerseFieldInternalVariable_"):
+                raise ValueError(
+                    "event names must be public names, not internal names")
+            if name == "BackPointer":
+                raise ValueError(
+                    "BackPointer is reserved by Verse UI event fields")
 
         wbp = _el.load_asset(wbp_path)
         existing = set(str(n) for n in _bel.list_member_variable_names(wbp))
+        public_existing = {f["name"] for f in list_verse_fields(wbp_path)}
 
-        created, skipped = [], []
-        for name, kind in fields:
-            if name in existing:
+        # Preflight the whole batch before writing anything. An event's public
+        # function graph is a real Blueprint symbol and must not collide with
+        # an existing member or graph, even though its storage member carries
+        # the internal name. specs = (public, actual member, kind, event param).
+        specs, skipped = [], []
+        for name, kind, param in fields:
+            actual = ("VerseFieldInternalVariable_" + name
+                      if kind == "event" else name)
+            if name in public_existing or actual in existing:
                 skipped.append(name)
                 continue
-            _bel.add_member_variable(wbp, name, _pin_type(kind))
-            created.append(name)
+            specs.append((name, actual, kind, param))
+            if kind == "event":
+                graph, _has_entry = _event_function_graph_status(wbp, name)
+                if name in existing or graph is not None:
+                    raise ValueError(
+                        "event public name %r collides with an existing "
+                        "member or graph" % name)
 
+        for public, actual, kind, _param in specs:
+            if not _bel.add_member_variable(wbp, actual, _pin_type(kind)):
+                raise RuntimeError("could not create Blueprint member %r" % actual)
+            existing.add(actual)
+            if kind == "event":
+                graph = _bel.add_function_graph(wbp, public)
+                if graph is None:
+                    raise RuntimeError(
+                        "could not create public event function graph %r" % public)
+
+        back_pointer_created = False
+        if any(kind == "event" for _public, _actual, kind, _param in specs) \
+                and "BackPointer" not in existing:
+            if not _bel.add_member_variable(
+                    wbp, "BackPointer", _pin_type("back_pointer")):
+                raise RuntimeError("could not create shared BackPointer")
+            back_pointer_created = True
+            existing.add("BackPointer")
+
+        created = [public for public, _actual, _kind, _param in specs]
         if not created:
             return {"created": [], "skipped_existing": skipped, "verified": {}}
 
@@ -1136,7 +2971,8 @@ if not _needs_restart:
         guids = variable_guids(wbp_path)
         wbp = _el.load_asset(wbp_path)
 
-        kinds = dict(fields)
+        by_actual = {actual: (public, kind, param)
+                     for public, actual, kind, param in specs}
         uobject = ctypes.c_uint64.from_address(id(wbp) + 16).value
         probe = next(iter(guids))
         data, count = _find_newvars(uobject, _guid_bytes(guids[probe]), len(guids))
@@ -1146,15 +2982,26 @@ if not _needs_restart:
             descriptor = data + index * _DESC_SIZE
             guid = bytes((ctypes.c_uint8 * 16).from_address(descriptor + _GUID_OFFSET))
             name = next((n for n, g in guids.items() if _guid_bytes(g) == guid), None)
-            if name not in created:
+            if name == "BackPointer" and back_pointer_created:
+                block, entries = _build_metadata_block(
+                    "Back Pointer", hidden_only=True)
+                flags = _VERSE_PROPERTY_FLAGS
+                public_name = None
+            elif name in by_actual:
+                public_name, kind, param = by_actual[name]
+                block, entries = _build_metadata_block(
+                    public_name, disable_default=(kind == "message"),
+                    event=(kind == "event"), event_param=param)
+                flags = (_VERSE_EVENT_PROPERTY_FLAGS
+                         if kind == "event" else _VERSE_PROPERTY_FLAGS)
+            else:
                 continue
-            block, entries = _build_metadata_block(name, kinds[name] == "message")
             ctypes.c_uint64.from_address(descriptor + _METADATA_OFFSET).value = block
             ctypes.c_uint32.from_address(descriptor + _METADATA_OFFSET + 8).value = entries
             ctypes.c_uint32.from_address(descriptor + _METADATA_OFFSET + 12).value = entries
-            ctypes.c_uint64.from_address(descriptor + _PROPERTY_FLAGS_OFFSET).value = \
-                _VERSE_PROPERTY_FLAGS
-            patched.append(name)
+            ctypes.c_uint64.from_address(descriptor + _PROPERTY_FLAGS_OFFSET).value = flags
+            if public_name is not None:
+                patched.append(public_name)
 
         missing = sorted(set(created) - set(patched))
         if missing:
@@ -1163,47 +3010,143 @@ if not _needs_restart:
                 "not Verse fields. Delete them before retrying." % (missing,))
 
         if category:
-            for name in created:
-                _bel.set_blueprint_variable_category(wbp, name, category)
+            for _public, actual, _kind, _param in specs:
+                _bel.set_blueprint_variable_category(wbp, actual, category)
 
+        # Drop each event's function graph before saving. A real Verse event does
+        # not persist one (Verse regenerates it on load), and the SAVED one
+        # add_function_graph makes is restricted content: the validator's Sanitize
+        # pass deletes the whole field. The graph IS needed up to here (the field
+        # won't register as an event without it) -- create, patch, then remove.
+        for public, _actual, kind, _param in specs:
+            if kind == "event":
+                _bel.remove_function_graph(wbp, public)
+
+        # This is the save that has to carry the patched metadata into the file,
+        # so it must go through the full save path -- save_asset would write the
+        # package while leaving the VerseClassFields tag stale, and the fields
+        # would come back as plain BP variables the next time the asset is read.
         _bel.compile_blueprint(wbp)
-        _el.save_asset(wbp_path)
+        _save_regenerating_tags(wbp_path)
 
         # VerseClassFields is regenerated by the engine on save -- the honest check.
         asset = _el.find_asset_data(wbp_path)
         blob = str(asset.get_tag_value("VerseClassFields") or "")
         present = set(re.findall(r'\(Name="([^"]+)"', blob))
-        verified = {n: n in present for n in created}
+        verified = {}
+        for public, actual, kind, _param in specs:
+            if kind == "event":
+                pattern = (r'\(Name="%s",InternalName="%s".*?Type=Event,'
+                           % (re.escape(public), re.escape(actual)))
+                verified[public] = re.search(pattern, blob) is not None
+            else:
+                verified[public] = public in present
         failed = [n for n, ok in verified.items() if not ok]
         if failed:
             raise RuntimeError("patched but absent from VerseClassFields: %r" % (failed,))
 
-        # Mark as created-this-session — deleting these before an editor restart
-        # would make the engine free our ctypes metadata buffers and crash.
-        _CREATED_THIS_SESSION.update((wbp_path, n) for n in created)
+        # Nothing is detached here, DELIBERATELY: the descriptors keep pointing at
+        # our ctypes buffers all session (_KEEP holds them alive), and detaching
+        # would make any later save write emptied metadata, demoting the fields to
+        # plain BP variables. The danger is only a descriptor DESTROYED while still
+        # attached (FMemory::Free on memory the engine never allocated) -- the two
+        # places that can, _unload and delete_verse_fields, null the arrays first.
 
         return {"created": created, "skipped_existing": skipped, "verified": verified}
 
-    def set_fields_category(wbp_path, names, category):
-        """Move member variables to `category` (public API), compile and save."""
+    @_keeps_editor_open
+    def create_verse_fields(wbp_path, fields, category=None):
+        """Transactional wrapper: on any failure, roll back the members and
+        graphs this call created, so a half-made event never survives.
+        """
+        # An EVENT field adds a graph and compiles, which tears the tab down -- the
+        # only op here that does. Close it deliberately so _reopen_editor knows to
+        # put it back; once the engine destroys the tab there is nothing to detect.
+        if any(_field_spec(f)[1] == "event" for f in fields):
+            _close_editor(wbp_path)
+        return _create_verse_fields_guarded(wbp_path, fields, category)
+
+    def _create_verse_fields_guarded(wbp_path, fields, category=None):
         wbp = _el.load_asset(wbp_path)
+        fields = [_field_spec(f) for f in fields]
+        before_members = set(str(n) for n in _bel.list_member_variable_names(wbp))
+        before_graphs = {name: _bel.find_graph(wbp, name) is not None
+                         for name, kind, _param in fields if kind == "event"}
+        try:
+            return _create_verse_fields_impl(wbp_path, fields, category=category)
+        except Exception as original:
+            rollback_errors = []
+            try:
+                wbp = _el.load_asset(wbp_path)
+                actual_names, event_names = [], []
+                for public, kind, _param in fields:
+                    actual = ("VerseFieldInternalVariable_" + public
+                              if kind == "event" else public)
+                    if actual not in before_members:
+                        actual_names.append(actual)
+                    if kind == "event" and not before_graphs.get(public, False):
+                        if _bel.find_graph(wbp, public) is not None:
+                            event_names.append(public)
+                if "BackPointer" not in before_members:
+                    current = set(str(n)
+                                  for n in _bel.list_member_variable_names(wbp))
+                    if "BackPointer" in current:
+                        actual_names.append("BackPointer")
+
+                # Memory-patched metadata may point at ctypes-owned buffers;
+                # null those arrays before variable destruction. A pre-compile
+                # failure simply has nothing to detach yet.
+                if actual_names:
+                    try:
+                        _detach_metadata_arrays(wbp, wbp_path, actual_names)
+                    except Exception as exc:
+                        rollback_errors.append("metadata detach: %s" % exc)
+                for public in event_names:
+                    try:
+                        _bel.remove_function_graph(wbp, public)
+                    except Exception as exc:
+                        rollback_errors.append(
+                            "remove graph %s: %s" % (public, exc))
+                editor = unreal.BlueprintGraphEditor.get_graph_editor_by_name(
+                    wbp, "EventGraph")
+                current = set(str(n) for n in _bel.list_member_variable_names(wbp))
+                for actual in actual_names:
+                    if actual in current:
+                        try:
+                            editor.remove_member_variable(actual)
+                        except Exception as exc:
+                            rollback_errors.append(
+                                "remove member %s: %s" % (actual, exc))
+                _bel.compile_blueprint(wbp)
+                _el.save_asset(wbp_path)
+            except Exception as exc:
+                rollback_errors.append(str(exc))
+            detail = ("; rollback warnings: %s" % "; ".join(rollback_errors)
+                      if rollback_errors else "; partial creation rolled back")
+            raise RuntimeError("%s%s" % (original, detail)) from original
+
+    @_keeps_editor_open
+    def set_fields_category(wbp_path, names, category):
+        """Move member variables to `category` (public API), compile and save.
+
+        Event fields store under their internal member name, so the public
+        name shown in the UI has to be mapped before the engine call.
+        """
+        wbp = _el.load_asset(wbp_path)
+        kinds = {f["name"]: f["type"] for f in list_verse_fields(wbp_path)}
         for name in names:
-            _bel.set_blueprint_variable_category(wbp, name, category)
+            actual = ("VerseFieldInternalVariable_" + name
+                      if kinds.get(name) == "event" else name)
+            _bel.set_blueprint_variable_category(wbp, actual, category)
         _bel.compile_blueprint(wbp)
         _el.save_asset(wbp_path)
 
     def _detach_metadata_arrays(wbp, wbp_path, names):
-        """Null the MetaDataArray TArray of each named descriptor before deletion.
-
-        A field created THIS session has its MetaDataArray data pointer aimed at one
-        of OUR ctypes buffers. If the descriptor is destroyed with that pointer live,
-        UE's TArray destructor calls FMemory::Free() on memory it never allocated →
-        heap-corruption crash. Setting the TArray empty (data=0, count=0, max=0)
-        makes its destructor a no-op (Free(nullptr) is safe). The metadata is already
-        serialized to disk, and the variable is being removed anyway, so nothing is
-        lost. Fields deserialized from disk (prior session) already point at
-        engine-owned memory; nulling theirs is harmless too, so we do it uniformly.
-        """
+        """Null the MetaDataArray TArray of each named descriptor before it can
+        be destroyed. A field created THIS session points at OUR ctypes buffers;
+        destroying its descriptor live means FMemory::Free() on memory UE never
+        allocated → heap-corruption crash. An empty TArray's destructor is a
+        no-op, and nulling engine-owned arrays is harmless, so it's uniform."""
         guids = variable_guids(wbp_path)
         doomed = {n for n in names if n in guids}
         if not doomed:
@@ -1222,32 +3165,57 @@ if not _needs_restart:
                 ctypes.c_uint32.from_address(desc + _METADATA_OFFSET + 8).value = 0
                 ctypes.c_uint32.from_address(desc + _METADATA_OFFSET + 12).value = 0
 
+    @_keeps_editor_open
     def delete_verse_fields(wbp_path, names):
         """Delete member variables — safely, even same-session.
 
-        NEVER use remove_unused_variables here: it deletes EVERY variable with no
-        references, which includes every not-yet-bound Verse field. Bindings
-        sourced from the deleted fields are dropped too (they would dangle).
-
-        Same-session fields are memory-patched to point their MetaDataArray at our
-        ctypes buffers; deleting one lets UE free that buffer → crash. So we first
-        DETACH every doomed field's MetaDataArray (null the TArray, no-op destructor)
-        and only then remove the variable. No editor restart needed.
-
+        NEVER use remove_unused_variables: it deletes EVERY unreferenced
+        variable, including every not-yet-bound Verse field. Doomed fields'
+        MetaDataArrays are detached first (see _detach_metadata_arrays), and
+        bindings sourced from them are dropped (they would dangle).
         Returns {deleted, failed, bindings_dropped}.
+
+        Deleting an EVENT field closes the widget's editor tab (it removes a
+        function graph, and may run the disk patcher to drop that field's event
+        bindings); deleting a plain field does not. _keeps_editor_open covers
+        both rather than making the tab depend on which fields were picked.
         """
         if not names:
             return {"deleted": [], "failed": [], "bindings_dropped": 0}
 
+        # BackPointer is shared by EVERY event field (their graphs use it as
+        # the Target pin): deleting it breaks all of them at the next compile,
+        # and recreating the variable does NOT repair the severed connections.
+        if "BackPointer" in names:
+            raise ValueError(
+                "BackPointer is shared infrastructure for every event field on "
+                "this widget and must not be deleted")
+
+        # Event fields: drop their on-disk event bindings first (a deleted
+        # field would leave them dangling), then delete under the INTERNAL
+        # member name, and remove the public function graph too.
+        field_types = {f["name"]: f["type"] for f in list_verse_fields(wbp_path)}
+        event_fields = {n for n in names if field_types.get(n) == "event"}
+        if event_fields:
+            doomed_events = [e["event"] for e in list_event_bindings(wbp_path)
+                             if e["field"] in event_fields]
+            if doomed_events:
+                remove_event_bindings(wbp_path, doomed_events)
+        actual_names = [("VerseFieldInternalVariable_" + n
+                         if field_types.get(n) == "event" else n)
+                        for n in names]
+
         wbp = _el.load_asset(wbp_path)
         # Detach BEFORE removal so the descriptor destructor frees nothing of ours.
-        _detach_metadata_arrays(wbp, wbp_path, names)
+        _detach_metadata_arrays(wbp, wbp_path, actual_names)
+        for public_name in event_fields:
+            if _bel.find_graph(wbp, public_name) is not None:
+                _bel.remove_function_graph(wbp, public_name)
         editor = unreal.BlueprintGraphEditor.get_graph_editor_by_name(wbp, "EventGraph")
-        for name in names:
-            editor.remove_member_variable(name)
-            _CREATED_THIS_SESSION.discard((wbp_path, name))
+        for actual_name in actual_names:
+            editor.remove_member_variable(actual_name)
 
-        doomed = set(names)
+        doomed = set(actual_names) | set(names)
         subsystem = unreal.get_editor_subsystem(unreal.MVVMEditorSubsystem)
         view = subsystem.get_view(wbp)
         dropped = 0
@@ -1270,28 +3238,33 @@ if not _needs_restart:
                 "failed": [n for n in names if n in remaining],
                 "bindings_dropped": dropped}
 
-    def expand_batch_spec(spec, kind, start, count):
-        """Expand a batch spec into [(name, kind)] pairs.
+    def expand_batch_spec(spec, kind, start, count, param=None):
+        """Expand a batch spec into create-field specs.
 
         `spec` is a name pattern. `#` (or `{n}`) marks where the running index
         goes; a bare pattern with count>1 gets the index appended. count==1 with
-        no placeholder creates a single field. Returns (pairs, error_or_None).
+        no placeholder creates a single field. `param` is an event field's
+        parameter (int/float/logic), so a whole batch can be `event (int)`.
+        Returns (specs, error_or_None); each spec is (name, kind[, param]).
         """
         spec = spec.strip()
         if not spec:
             return [], "Enter a field name or pattern."
         if kind not in _CREATE_TYPES:
             return [], "Unknown type %r." % kind
+        if param is not None and param not in _EVENT_PARAM_PINS:
+            return [], "Unknown event parameter %r." % param
+
+        def make(name):
+            return (name, kind, param) if param else (name, kind)
 
         parts = _split_pattern(spec)
         if count <= 1 and parts is None:
-            return [(spec, kind)], None
+            return [make(spec)], None
         pre, post = parts or (spec, "")
 
-        pairs = []
-        for i in range(start, start + max(count, 1)):
-            pairs.append(("%s%d%s" % (pre, i, post), kind))
-        return pairs, None
+        return [make("%s%d%s" % (pre, i, post))
+                for i in range(start, start + max(count, 1))], None
 
     # ═══════════════════════════════════════════════════════════════════════
     #  UI
@@ -1302,6 +3275,7 @@ if not _needs_restart:
         "string": "#ff5ecf", "message": "#ff8fd8",
         "color": "#0e86ff", "color_alpha": "#0e86ff",
         "material": "#00d9d9", "texture": "#00d9d9",
+        "event": "#ffb800",
     }
 
     # Bulk mode only offers DIRECTLY-bindable props (it authors real bindings, so
@@ -1311,21 +3285,35 @@ if not _needs_restart:
         "Image": ["ColorAndOpacity", "RenderOpacity"],
     }
 
+    def _html(color, text):
+        return '<span style="color:%s">%s</span>' % (color, text)
+
     class VerseBinderWindow(QMainWindow):
         def __init__(self):
             super().__init__()
             self.setWindowTitle("Verse Fields + Binding Tool")
+            # Wide enough that the Bind tab's four target columns all fit without
+            # clipping -- a Custom Button's name and class are long, and a clipped
+            # TARGET column hides the event dropdown entirely.
             self.setMinimumSize(940, 680)
-            self.resize(1080, 780)
+            self.resize(1320, 820)
             self._wbp_path = None
             self._fields = []
             self._visible_fields = []   # _fields after the category filter + sort
             self._manage_rows = []      # _fields after the Manage tab's sort
             self._widgets = []
             self._child_widgets = []
+            self._event_widgets = []    # only widgets that declare event delegates
             self._target_rows = []
             self._pending_pairs = []
+            self._pending_target = None
             self._build_ui()
+            # Every engine op that reopens the widget raises UEFN over the tool.
+            # Registering here (rather than calling _reclaim_focus from each
+            # handler) means failure paths -- which return early -- get the focus
+            # back too. Replace, don't append: reopening the tool builds a fresh
+            # window, and a stale callback would target a deleted one.
+            _ON_EDITOR_RAISED[:] = [self._reclaim_focus]
 
         def _build_ui(self):
             central = QWidget()
@@ -1396,6 +3384,39 @@ if not _needs_restart:
             self._setup_table(self.tbl_targets, multi=True)
             tl.addWidget(self.tbl_targets)
             trow = QHBoxLayout()
+            # Only a PARAMETERISED event field can carry a value, so this whole
+            # group hides itself for anything else (see _sync_param_row) rather
+            # than sitting there greyed out for the majority of fields.
+            self.param_label = QLabel("Param 0:")
+            self.param_value = QLineEdit()
+            self.param_value.setPlaceholderText("0")
+            self.param_value.setFixedWidth(70)
+            self.param_value.setToolTip(
+                "The value each button passes to the event.\n"
+                "With Auto-number ticked, this is the FIRST value and the rest\n"
+                "count up in row order — 10 buttons from 1 give 1..10.")
+            # A logic parameter is a BOOLEAN, so it gets a tick rather than the
+            # text box -- typed free text there could only ever be "true"/"false"
+            # (anything else is a value the engine cannot parse), and a checkbox
+            # cannot express one.
+            self.param_bool = TickBox("true")
+            self.param_bool.setToolTip(
+                "The logic value each selected button passes to the event.")
+            self.param_bool.toggled.connect(
+                lambda on: self.param_bool.setText("true" if on else "false"))
+            self.param_auto = TickBox("Auto-number")
+            self.param_auto.setChecked(True)
+            self.param_auto.setToolTip(
+                "Give each selected button the next value in sequence.\n"
+                "Untick to pass the SAME value to all of them.")
+            for w in (self.param_label, self.param_value, self.param_bool,
+                      self.param_auto):
+                w.setVisible(False)
+            trow.addWidget(self.param_label)
+            trow.addWidget(self.param_value)
+            trow.addWidget(self.param_bool)
+            trow.addWidget(self.param_auto)
+
             btn_unbind = QPushButton("Unbind")
             btn_unbind.clicked.connect(self._unbind_selected)
             btn_zip = QPushButton("Bind Selected Pairs")
@@ -1423,9 +3444,18 @@ if not _needs_restart:
             self.field_pattern.setEditable(True)
             self.field_pattern.lineEdit().setPlaceholderText("VF_Slot#Image")
             self.field_pattern.activated.connect(self._auto_pick_bulk_target)
+            # The combo is editable, so a hand-typed pattern never fires activated();
+            # without this the target list would still be filtered for the OLD family.
+            self.field_pattern.lineEdit().editingFinished.connect(
+                self._auto_pick_bulk_target)
             self.widget_pattern = ArrowCombo()
             self.widget_pattern.setEditable(True)
             self.widget_pattern.lineEdit().setPlaceholderText("Slot#  or  Image#")
+            # The target list is filtered by which widgets this pattern matches --
+            # a family of TextBlocks must not be offered Image · ColorAndOpacity.
+            self.widget_pattern.activated.connect(self._refresh_target_combo)
+            self.widget_pattern.lineEdit().editingFinished.connect(
+                self._refresh_target_combo)
             # One merged target dropdown: engine properties + child Verse fields.
             self.target_combo = ArrowCombo()
             row.addWidget(QLabel("Field pattern:"))
@@ -1473,7 +3503,7 @@ if not _needs_restart:
             self.create_name = QLineEdit()
             self.create_name.setPlaceholderText("VF_Color#")
             self.create_type = ArrowCombo()
-            self.create_type.addItems(_CREATE_TYPES)
+            self.create_type.addItems(_CREATE_LABELS)
             self.create_type.setCurrentText("color")
             self.create_start = QSpinBox()
             self.create_start.setRange(0, 9999)
@@ -1563,30 +3593,47 @@ if not _needs_restart:
             return tab
 
         def _mlog(self, msg, color=None):
-            self.manage_log.append(
-                '<span style="color:%s">%s</span>' % (color, msg) if color else msg)
+            self.manage_log.append(_html(color, msg) if color else msg)
+
+        def _fill_field_rows(self, table, fields):
+            """Fill a Field/Type/Category table from a field list."""
+            table.setRowCount(len(fields))
+            for r, field in enumerate(fields):
+                table.setItem(r, 0, QTableWidgetItem(field["name"]))
+                # An event's parameter rides in the type cell -- "event (int)" --
+                # but the colour still keys off the kind, so every event reads as
+                # one family.
+                label = field["type"]
+                if field.get("param"):
+                    label = "%s (%s)" % (label, field["param"])
+                type_item = QTableWidgetItem(label)
+                type_item.setForeground(QColor(_TYPE_COLOR.get(field["type"], C_TX0)))
+                table.setItem(r, 1, type_item)
+                cat_item = QTableWidgetItem(field.get("category", "Default"))
+                cat_item.setForeground(QColor(C_TX2))
+                table.setItem(r, 2, cat_item)
+            self._fit_columns(table, stretch_col=0)
+
+        def _fill_category_combo(self, combo):
+            """Offer the widget's existing categories, keeping any typed text.
+
+            The field stays empty unless the user typed/picked something — an
+            editable combo would otherwise show item 0, defeating the placeholder.
+            """
+            typed = combo.currentText()
+            combo.clear()
+            for cat in sorted({f.get("category", "Default") for f in self._fields}):
+                combo.addItem(cat)
+            combo.setCurrentText(typed)
+            if not typed:
+                combo.setCurrentIndex(-1)
 
         def _refresh_manage(self):
             # Rows map to _manage_rows, not _fields — the sort may reorder them.
             self._manage_rows = self._apply_sort(
                 list(self._fields), self.manage_sort.state)
-            self.tbl_manage.setRowCount(len(self._manage_rows))
-            for r, field in enumerate(self._manage_rows):
-                self.tbl_manage.setItem(r, 0, QTableWidgetItem(field["name"]))
-                type_item = QTableWidgetItem(field["type"])
-                type_item.setForeground(QColor(_TYPE_COLOR.get(field["type"], C_TX0)))
-                self.tbl_manage.setItem(r, 1, type_item)
-                cat_item = QTableWidgetItem(field.get("category", "Default"))
-                cat_item.setForeground(QColor(C_TX2))
-                self.tbl_manage.setItem(r, 2, cat_item)
-            self._fit_columns(self.tbl_manage, stretch_col=0)
-            typed = self.manage_category.currentText()
-            self.manage_category.clear()
-            for cat in sorted({f.get("category", "Default") for f in self._fields}):
-                self.manage_category.addItem(cat)
-            self.manage_category.setCurrentText(typed)
-            if not typed:
-                self.manage_category.setCurrentIndex(-1)
+            self._fill_field_rows(self.tbl_manage, self._manage_rows)
+            self._fill_category_combo(self.manage_category)
 
         def _manage_selected(self):
             # Index the SORTED list — table rows map to _manage_rows.
@@ -1681,27 +3728,104 @@ if not _needs_restart:
             table.horizontalHeader().setStretchLastSection(True)
             table.setWordWrap(False)
 
-        def _refresh_target_combo(self):
-            """Bulk target list: engine properties plus the loaded widget's child fields."""
+        def _refresh_target_combo(self, _index=None):
+            """Bulk target list, filtered to what the CHOSEN PATTERNS can bind.
+
+            A function of BOTH patterns: the field pattern rules out whole kinds
+            (an event field can never bind a property, a color never an event),
+            the widget pattern rules out the rest (Image · ColorAndOpacity
+            cannot match a family of TextBlocks).
+            """
             self.target_combo.clear()
-            for cls in sorted(_BULK_PROPS):
-                for prop in _BULK_PROPS[cls]:
-                    self.target_combo.addItem("%s · %s" % (cls, prop),
-                                              ("native", cls, prop))
-            for name in sorted({f["name"] for c in self._child_widgets
-                                for f in c["fields"]}):
-                self.target_combo.addItem("Sub-widget · %s" % name, ("child", name))
+            types = self._pattern_field_types()
+            props = types - {"event"}
+
+            if props:
+                # Only classes the matched widgets really are, and only properties a
+                # field of the chosen type binds to with no conversion.
+                for cls in sorted(_BULK_PROPS):
+                    if cls not in self._pattern_widget_classes():
+                        continue
+                    for prop in _BULK_PROPS[cls]:
+                        if not any(is_direct_bindable(t, cls, prop) for t in props):
+                            continue
+                        self.target_combo.addItem("%s · %s" % (cls, prop),
+                                                  ("native", cls, prop))
+                # Sub-widget fields: bind field-to-field, so the types must match.
+                for name in sorted({f["name"] for c in self._pattern_children()
+                                    for f in c["fields"] if f["type"] in props}):
+                    self.target_combo.addItem("Sub-widget · %s" % name,
+                                              ("child", name))
+
+            # Event targets. Offer each label once, no matter how the buttons spell it.
+            if "event" in types:
+                for label in sorted({label for w in self._pattern_event_widgets()
+                                     for _d, label in w["delegates"]}):
+                    self.target_combo.addItem("Event · %s" % label, ("event", label))
+
+        def _matched(self, items):
+            """The `items` whose names match the current widget pattern.
+
+            An empty or unmatched pattern narrows nothing -- fall back to all of them, so
+            a half-typed pattern empties the target list instead of just not filtering.
+            """
+            pattern = self.widget_pattern.currentText().strip()
+            if not pattern:
+                return items
+            hits = [i for group in _index_by_pattern(items, pattern).values()
+                    for i in group]
+            return hits or items
+
+        def _pattern_widget_classes(self):
+            return {w["native"] for w in self._matched(self._widgets)}
+
+        def _pattern_children(self):
+            return self._matched(self._child_widgets)
+
+        def _pattern_event_widgets(self):
+            return self._matched(self._event_widgets)
+
+        def _pattern_field_types(self):
+            """Verse types of the fields the current field pattern actually matches.
+
+            An unmatched or empty pattern tells us nothing about intent, so fall back to
+            every type on the widget -- an empty target list would look like a bug.
+            """
+            pattern = self.field_pattern.currentText().strip()
+            if pattern:
+                matched = _index_by_pattern(self._fields, pattern)
+                types = {f["type"] for fs in matched.values() for f in fs}
+                if types:
+                    return types
+            return {f["type"] for f in self._fields}
+
+        def _refresh_widget_pattern_combo(self):
+            """Widget families the CHOSEN FIELD FAMILY could actually bind to.
+
+            Same rule as the target list: an event field binds a button and nothing
+            else, so offering Image# next to Slot1_# just invites a dead pairing.
+            """
+            keep = self.widget_pattern.currentText().strip()
+            self.widget_pattern.clear()
+            types = self._pattern_field_types()
+            names = []
+            if types - {"event"}:
+                # _widgets holds only the PROPERTY-bindable widgets (Image/TextBlock).
+                names += [w["name"] for w in self._widgets]
+                names += [c["name"] for c in self._child_widgets]
+            if "event" in types:
+                names += [w["name"] for w in self._event_widgets]
+            for pat, _n in detect_patterns(names):
+                self.widget_pattern.addItem(pat)
+            if keep and self.widget_pattern.findText(keep) >= 0:
+                self.widget_pattern.setCurrentText(keep)
 
         def _refresh_bulk_suggestions(self):
             """Fill both pattern dropdowns with families detected from real names."""
             self.field_pattern.clear()
             for pat, _n in detect_patterns([f["name"] for f in self._fields]):
                 self.field_pattern.addItem(pat)
-            self.widget_pattern.clear()
-            names = ([w["name"] for w in self._widgets]
-                     + [c["name"] for c in self._child_widgets])
-            for pat, _n in detect_patterns(names):
-                self.widget_pattern.addItem(pat)
+            self._refresh_widget_pattern_combo()
             # Walk the detected field families until one actually pairs with a
             # widget pattern + target (the largest family may be un-bulk-bindable,
             # e.g. textures with no direct engine target).
@@ -1712,6 +3836,7 @@ if not _needs_restart:
             else:
                 if self.field_pattern.count():
                     self.field_pattern.setCurrentIndex(0)
+                    self._refresh_widget_pattern_combo()
 
         def _auto_pick_bulk_target(self, _index=None):
             """Auto-select the widget pattern + target that pair best with the
@@ -1724,43 +3849,117 @@ if not _needs_restart:
             fpat = self.field_pattern.currentText().strip()
             if not fpat:
                 return False
+            # The widget list depends on the chosen field family, so re-derive it before
+            # scanning. The TARGET combo cannot be the source of candidates here: it is
+            # itself narrowed by the current widget pattern, and this scan is looking for
+            # a BETTER widget pattern -- so enumerate the unfiltered targets instead.
+            self._refresh_widget_pattern_combo()
             wpats = [self.widget_pattern.itemText(i)
                      for i in range(self.widget_pattern.count())]
             if not wpats:
                 wpats = [self.widget_pattern.currentText().strip()]
-            best = None   # (pair_count, widget_pattern, target_combo_index)
-            for i in range(self.target_combo.count()):
-                data = self.target_combo.itemData(i)
+            best = None   # (pair_count, widget_pattern, target_data)
+            for data in self._all_bulk_targets():
                 for wpat in wpats:
                     if not wpat:
                         continue
-                    if data[0] == "child":
-                        pairs, _ = match_child_by_suffix(
-                            self._fields, self._child_widgets, fpat, wpat, data[1])
-                    else:
-                        pairs, _ = match_by_suffix(
-                            self._fields, self._widgets, fpat, wpat, data[2])
+                    pairs, _ = self._match_for_target(data, fpat, wpat)
                     if pairs and (best is None or len(pairs) > best[0]):
-                        best = (len(pairs), wpat, i)
+                        best = (len(pairs), wpat, data)
             if best:
+                # Widget pattern first: the target list is filtered by it.
                 self.widget_pattern.setCurrentText(best[1])
-                self.target_combo.setCurrentIndex(best[2])
+                self._refresh_target_combo()
+                index = self.target_combo.findData(best[2])
+                if index >= 0:
+                    self.target_combo.setCurrentIndex(index)
                 self._log("Auto-detected: %s  →  %s . %s   (%d pairs — "
                           "Preview Matches to confirm)"
                           % (fpat, best[1], self.target_combo.currentText(), best[0]),
                           C_TX2)
                 return True
+            self._refresh_target_combo()
             if _index is not None:   # user picked this pattern — tell them it's dry
                 self._log("No widget pattern/target pairs up with '%s' — "
                           "set them manually." % fpat, C_TX2)
             return False
 
+        def _match_for_target(self, data, fpat, wpat):
+            """Dispatch a target tuple to its matcher -> (pairs, warnings)."""
+            if data[0] == "child":
+                return match_child_by_suffix(self._fields, self._child_widgets,
+                                             fpat, wpat, data[1])
+            if data[0] == "event":
+                return match_events_by_suffix(self._fields, self._event_widgets,
+                                              fpat, wpat, data[1])
+            return match_by_suffix(self._fields, self._widgets, fpat, wpat, data[2])
+
+        def _all_bulk_targets(self):
+            """Every target this widget could offer, ignoring the current patterns."""
+            out = []
+            for cls in sorted(_BULK_PROPS):
+                if cls in {w["native"] for w in self._widgets}:
+                    out += [("native", cls, prop) for prop in _BULK_PROPS[cls]]
+            out += [("child", name) for name in
+                    sorted({f["name"] for c in self._child_widgets for f in c["fields"]})]
+            out += [("event", label) for label in
+                    sorted({l for w in self._event_widgets for _d, l in w["delegates"]})]
+            return out
+
         def _log(self, msg, color=None):
-            self.log.append('<span style="color:%s">%s</span>' % (color, msg) if color else msg)
+            self.log.append(_html(color, msg) if color else msg)
             bar = self.log.verticalScrollBar()
             bar.setValue(bar.maximum())
             unreal.log("[VerseBinder] %s" % msg)
             QApplication.processEvents()
+
+        def _reclaim_focus(self):
+            """Bring the tool back to the front after an engine operation.
+
+            Qt's raise_()/activateWindow() are not enough: Windows only lets the
+            foreground-owning process hand focus away, so the fix is Win32
+            AttachThreadInput -> SetForegroundWindow -> detach (ctypes.windll;
+            pywin32 doesn't exist in UEFN's Python). The editor also raises
+            itself LATE — Slate focus work lands after this returns — so the
+            grab is re-asserted on a few later event-loop turns.
+
+            Do NOT call this from an operation handler: _keeps_editor_open fires
+            it (via _ON_EDITOR_RAISED) for every mutating call, on the failure
+            path too. Calling it by hand is what left the error branches -- which
+            return early -- stuck behind the editor.
+            """
+            self._grab_focus()
+            for delay in (60, 250, 600):
+                QTimer.singleShot(delay, self._grab_focus)
+
+        def _grab_focus(self):
+            """One attempt at taking the foreground. Safe to call repeatedly."""
+            try:
+                self.setWindowState(
+                    (self.windowState() & ~Qt.WindowState.WindowMinimized)
+                    | Qt.WindowState.WindowActive)
+                self.show()
+                self.raise_()
+                self.activateWindow()
+
+                user32 = ctypes.windll.user32
+                hwnd = int(self.winId())
+                fg = user32.GetForegroundWindow()
+                if not hwnd or fg == hwnd:
+                    return
+                ours = user32.GetWindowThreadProcessId(hwnd, None)
+                theirs = user32.GetWindowThreadProcessId(fg, None)
+                attached = theirs and ours != theirs and user32.AttachThreadInput(
+                    theirs, ours, True)
+                try:
+                    user32.SetForegroundWindow(hwnd)
+                    user32.BringWindowToTop(hwnd)
+                    user32.SetActiveWindow(hwnd)
+                finally:
+                    if attached:
+                        user32.AttachThreadInput(theirs, ours, False)
+            except Exception:
+                pass          # focus is a nicety; never fail the operation over it
 
         # ── data ────────────────────────────────────────────────────────────
         @staticmethod
@@ -1795,14 +3994,16 @@ if not _needs_restart:
             _child_fields_cache.clear()
             try:
                 fields = list_verse_fields(path)
-                entries = _widget_tree_entries(path)   # one T3D export for both
+                entries = _widget_tree_entries(path)   # one T3D export for all three
                 widgets = list_widgets(path, entries)
                 children = list_child_widgets(path, entries)
+                event_widgets = list_event_widgets(path, entries)
             except Exception as exc:
                 self._log("Load failed: %s" % exc, C_ERR)
                 return
             self._wbp_path, self._fields = path, fields
             self._widgets, self._child_widgets = widgets, children
+            self._event_widgets = event_widgets
             # Show just the widget name now that the full path is remembered.
             self.path_edit.setText(self._widget_name(path))
             self.log.clear()
@@ -1819,20 +4020,7 @@ if not _needs_restart:
             self._refresh_manage()
 
         def _refresh_category_combo(self):
-            """Offer the widget's existing variable categories in the Create tab.
-
-            No blank entry — the placeholder already means "no category"; the list
-            is just the real categories present on the widget.
-            """
-            typed = self.create_category.currentText()
-            self.create_category.clear()
-            for cat in sorted({f.get("category", "Default") for f in self._fields}):
-                self.create_category.addItem(cat)
-            # Keep the field empty unless the user had typed/picked something —
-            # an editable combo shows item 0 otherwise, defeating the placeholder.
-            self.create_category.setCurrentText(typed)
-            if not typed:
-                self.create_category.setCurrentIndex(-1)
+            self._fill_category_combo(self.create_category)
 
         def _bound_map(self):
             return {(b["widget"], b["prop"]): (b["source"], b["has_conversion"])
@@ -1878,16 +4066,7 @@ if not _needs_restart:
                                     if cat == "All" or f.get("category", "Default") == cat]
             self._visible_fields = self._apply_sort(
                 self._visible_fields, self.fields_sort.state)
-            self.tbl_fields.setRowCount(len(self._visible_fields))
-            for r, field in enumerate(self._visible_fields):
-                self.tbl_fields.setItem(r, 0, QTableWidgetItem(field["name"]))
-                type_item = QTableWidgetItem(field["type"])
-                type_item.setForeground(QColor(_TYPE_COLOR.get(field["type"], C_TX0)))
-                self.tbl_fields.setItem(r, 1, type_item)
-                cat_item = QTableWidgetItem(field.get("category", "Default"))
-                cat_item.setForeground(QColor(C_TX2))
-                self.tbl_fields.setItem(r, 2, cat_item)
-            self._fit_columns(self.tbl_fields, stretch_col=0)
+            self._fill_field_rows(self.tbl_fields, self._visible_fields)
 
         @staticmethod
         def _fit_columns(table, stretch_col):
@@ -1924,7 +4103,14 @@ if not _needs_restart:
             field = self._selected_field()
             self.tbl_targets.setRowCount(0)
             self._target_rows = []
+            # Every path out of here goes through this, including the early
+            # returns -- deselecting must put the Param 0 row away too.
+            self._sync_param_row(field)
             if not field or not self._wbp_path:
+                return
+
+            if field["type"] == "event":
+                self._refresh_event_targets(field)
                 return
 
             bound = self._bound_map()
@@ -1988,6 +4174,203 @@ if not _needs_restart:
                           "(engine properties and sub-widget fields both checked)."
                           % field["type"], C_TX2)
 
+        def _sync_param_row(self, field):
+            """Show the Param 0 control only for a field that HAS a parameter.
+
+            A plain event, and every non-event field, has no pin to hold a value,
+            so the row hides rather than greying out -- most fields are not
+            parameterised and a permanently-dead control just adds noise.
+            """
+            param = (field or {}).get("param")
+            numeric = param in ("int", "float")
+
+            self.param_label.setVisible(bool(param))
+            # A logic parameter takes the tick; int/float take the text box. Only
+            # ONE is ever up, so there is no dead control to wonder about -- and
+            # numbering is meaningless for a bool, so Auto-number goes away with
+            # the box rather than sitting there disabled.
+            self.param_value.setVisible(numeric)
+            self.param_auto.setVisible(numeric)
+            self.param_bool.setVisible(param == "logic")
+            if not param:
+                return
+
+            self.param_label.setText("Param 0 (%s):" % param)
+            if numeric:
+                # Constrain the box to the parameter's own type, so a value the
+                # engine cannot parse simply cannot be typed. Rebuild it on every
+                # switch: an int validator left on a float field would refuse the
+                # decimal point.
+                if param == "int":
+                    self.param_value.setValidator(QIntValidator(self.param_value))
+                else:
+                    # StandardNotation: a float pin takes "2.5", not "2.5e0".
+                    validator = QDoubleValidator(self.param_value)
+                    validator.setNotation(
+                        QDoubleValidator.Notation.StandardNotation)
+                    self.param_value.setValidator(validator)
+
+                # Seed the box with the field's own default the first time it is
+                # shown, so binding without touching it matches what the MVVM
+                # panel would have produced by hand. Re-seed when switching kinds
+                # too: "2.5" left over from a float field is not a valid int, and
+                # the validator would strand it there unfixable.
+                text = self.param_value.text().strip()
+                if not text or self.param_value.hasAcceptableInput() is False:
+                    self.param_value.setText(_EVENT_PARAM_DEFAULTS.get(param, ""))
+
+        def _param_values(self, field, count):
+            """The value for each of `count` buttons, in row order -> [str] or None.
+
+            None when the field takes no parameter, which leaves every caller's
+            addition tuple 3 long and the binding parameterless.
+            """
+            param = (field or {}).get("param")
+            if not param:
+                return None
+
+            # A bool has nothing to count from: every button gets the tick's
+            # state, spelled the way the engine spells it.
+            if param == "logic":
+                return ["true" if self.param_bool.isChecked() else "false"] * count
+
+            # The box carries an Int/Double validator, so the text is a number of
+            # the right kind -- except for the partial entries a validator must
+            # permit while typing ("", "-", "2." on the way to "2.5"), which the
+            # field's own default stands in for.
+            text = self.param_value.text().strip()
+            try:
+                start = int(text) if param == "int" else float(text)
+            except ValueError:
+                start = float(_EVENT_PARAM_DEFAULTS[param])
+                if param == "int":
+                    start = int(start)
+
+            # Auto-number counts up the rows; unticked, every button gets `start`.
+            step = 1 if self.param_auto.isChecked() else 0
+
+            if param == "int":
+                return [str(start + i * step) for i in range(count)]
+
+            # A float pin wants a float LITERAL: "2", which the validator happily
+            # accepts, has to go out as "2.0". Keep the typed precision otherwise,
+            # so 0.5 counts 0.5, 1.5, 2.5.
+            decimals = max(len(text.split(".")[1]) if "." in text else 0, 1)
+            return ["%.*f" % (decimals, start + i * step) for i in range(count)]
+
+        def _refresh_event_targets(self, field):
+            """Event fields bind a widget's DELEGATE, not a property.
+
+            Rows come from the saved package (events live on disk). Creation
+            clones an existing event, and a widget with none gets one seeded, so
+            every row is bindable even on a widget that has never had an event.
+            """
+            try:
+                events = list_event_bindings(self._wbp_path)
+            except Exception as exc:
+                self._log("Could not read event bindings: %s" % exc, C_ERR)
+                return
+
+            # (widget, delegate) -> LIST of events: one delegate may drive
+            # several Verse fields; keying one-to-one would hide all but the last.
+            bound = {}
+            for ev in events:
+                bound.setdefault((ev["widget"], ev["delegate"]), []).append(ev)
+
+            # ONE row per widget, the event picked in the row (a row per
+            # widget x delegate is unusable: 4 buttons x 7 events = 28 rows).
+            rows = []
+            for w in self._event_widgets:
+                mine = [d for d, _l in w["delegates"]
+                        if any(e["field"] == field["name"]
+                               for e in bound.get((w["name"], d), ()))]
+                # Land on the event this field is already bound to, else On Clicked.
+                current = mine[0] if mine else w["delegates"][0][0]
+                rows.append({"kind": "event", "widget": w["name"],
+                             "display": w.get("display", w["name"]),
+                             "native": w["native"],
+                             "label": w.get("label", w["native"]),
+                             "delegates": w["delegates"],
+                             "delegate": current,
+                             "bound": bound,
+                             # Always bindable: a widget with no event to clone
+                             # gets one seeded (see _seed_first_event), so the
+                             # first binding no longer has to be made in the UI.
+                             "bindable": True,
+                             "has_conv": False})
+
+            self._target_rows = rows
+            self.tbl_targets.setRowCount(len(rows))
+            for r, row in enumerate(rows):
+                # Show the editor's names; the object name and real class are what get
+                # serialized, so keep both reachable on hover.
+                w_item = QTableWidgetItem(row["display"])
+                w_item.setToolTip(row["widget"])
+                self.tbl_targets.setItem(r, 0, w_item)
+                cls_item = QTableWidgetItem(row["label"])
+                cls_item.setToolTip(row["native"])
+                self.tbl_targets.setItem(r, 1, cls_item)
+
+                combo = ArrowCombo()      # plain QComboBox has no arrow: see ArrowCombo
+                for name, label in row["delegates"]:
+                    combo.addItem(label, name)
+                combo.setCurrentIndex(
+                    [n for n, _l in row["delegates"]].index(row["delegate"]))
+                combo.setEnabled(row["bindable"])
+                # Rebind the row's delegate on pick, and refresh CURRENT beside it --
+                # what a widget is already bound to depends on WHICH event is chosen.
+                combo.currentIndexChanged.connect(
+                    lambda _i, row=row, r=r, combo=combo, field=field:
+                        (row.__setitem__("delegate", combo.currentData()),
+                         self._set_event_current(r, row, field)))
+                self.tbl_targets.setCellWidget(r, 2, combo)
+
+                self._set_event_current(r, row, field)
+            # ResizeToContents measures the cell's ITEM; a cell WIDGET has none,
+            # so the TARGET column would collapse and clip the combo's drop-down
+            # button. Size that one column to the widgets it actually holds.
+            self._fit_columns(self.tbl_targets, stretch_col=3)
+            header = self.tbl_targets.horizontalHeader()
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+            want = max((self.tbl_targets.cellWidget(r, 2).sizeHint().width()
+                        for r in range(len(rows))), default=120)
+            self.tbl_targets.setColumnWidth(2, want + 12)
+
+            if not rows:
+                self._log("No widget on this blueprint can source an event.",
+                          C_TX2)
+
+        def _set_event_current(self, r, row, field):
+            """Fill the CURRENT column for one event row, for its CHOSEN delegate.
+
+            A delegate can drive several fields, so list them all -- showing only one
+            would make the others invisible and look like binding had replaced them.
+            """
+            evs = row["bound"].get((row["widget"], row["delegate"]), [])
+            others = [e["field"] for e in evs if e["field"] != field["name"]]
+            mine = next((e for e in evs if e["field"] == field["name"]), None)
+            has_mine = mine is not None
+
+            # For a parameterised event the VALUE is the whole point of the row --
+            # "← this field" alone cannot tell 10 buttons on one field apart.
+            label = "← this field"
+            if mine and mine.get("value") is not None:
+                label = "← this field  = %s" % mine["value"]
+
+            if has_mine and others:
+                item = QTableWidgetItem(label + "  + " + ", ".join(others))
+                item.setForeground(QColor(C_OK))
+            elif has_mine:
+                item = QTableWidgetItem(label)
+                item.setForeground(QColor(C_OK))
+            elif others:
+                item = QTableWidgetItem(", ".join(others))
+                item.setForeground(QColor(C_WARN))
+            else:
+                item = QTableWidgetItem("—")
+                item.setForeground(QColor(C_TX2))
+            self.tbl_targets.setItem(r, 3, item)
+
         def _selected_target_rows(self):
             rows = self.tbl_targets.selectionModel().selectedRows()
             return [self._target_rows[r.row()]
@@ -2009,6 +4392,34 @@ if not _needs_restart:
             if not field or not targets:
                 self._log("Select a field and at least one (unlocked) target.", C_WARN)
                 return
+            if field["type"] == "event":
+                # One delegate may drive SEVERAL fields, so skip only an exact
+                # duplicate of THIS field on THIS delegate — skipping every
+                # already-bound row would lock the button to its first field.
+                fresh = []
+                for t in targets:
+                    evs = t["bound"].get((t["widget"], t["delegate"]), [])
+                    if any(e["field"] == field["name"] for e in evs):
+                        continue          # this exact binding already exists
+                    fresh.append(t)
+                if not fresh:
+                    self._log("The selected widget(s) already fire this event.",
+                              C_WARN)
+                    return
+                # Number the buttons that are ACTUALLY being bound: counting over
+                # `targets` would burn a value on every already-bound row and leave
+                # gaps in the sequence.
+                values = self._param_values(field, len(fresh))
+                additions = []
+                for i, t in enumerate(fresh):
+                    addition = (t["widget"], field["name"], t["delegate"])
+                    if values is not None:
+                        addition += (values[i],)
+                        self._log("  %s  →  %s   Param 0 = %s"
+                                  % (t["widget"], field["name"], values[i]))
+                    additions.append(addition)
+                self._run_create_events(additions)
+                return
             pairs = [self._row_to_pair(field["name"], t) for t in targets]
             self._run_apply(pairs)
 
@@ -2020,15 +4431,81 @@ if not _needs_restart:
                 self._log("Select an EQUAL number of fields and unlocked targets "
                           "(%d field(s), %d target(s))." % (len(fields), len(targets)), C_WARN)
                 return
+            if fields[0]["type"] == "event":
+                # Target rows were built for an event field, so every pair must
+                # be one.
+                if any(f["type"] != "event" for f in fields):
+                    self._log("Pairing mixes event and non-event fields — "
+                              "select one kind at a time.", C_WARN)
+                    return
+                # The Param 0 box tracks the FIRST selected field, so it can only
+                # speak for pairs whose fields all share that parameter. Numbering
+                # across a mix of int and float fields would be nonsense.
+                values = None
+                if len({f.get("param") for f in fields}) == 1:
+                    values = self._param_values(fields[0], len(fields))
+
+                additions = []
+                for i, (f, t) in enumerate(zip(fields, targets)):
+                    # Pass the row's OWN delegate, or a clone keeps the template's.
+                    addition = (t["widget"], f["name"], t["delegate"])
+                    note = ""
+                    if values is not None:
+                        addition += (values[i],)
+                        note = "   Param 0 = %s" % values[i]
+                    additions.append(addition)
+                    self._log("  pair  %s  →  %s.%s%s"
+                              % (f["name"], t["widget"], t["delegate"], note))
+                self._run_create_events(additions)
+                return
             pairs = [self._row_to_pair(f["name"], t) for f, t in zip(fields, targets)]
             for f, t in zip(fields, targets):
                 self._log("  pair  %s  →  %s.%s" % (f["name"], t["widget"], t["dest"]))
             self._run_apply(pairs)
 
+        def _run_create_events(self, additions):
+            """Create event bindings by cloning on disk; the widget is closed,
+            patched, reloaded and recompiled — on failure the backup wins."""
+            try:
+                result = create_event_bindings(self._wbp_path, additions)
+            except Exception as exc:
+                self._log("Event create failed (asset restored from backup): %s"
+                          % exc, C_ERR)
+                return
+            for name, widget, field in result["created"]:
+                self._log("  created event   %s  →  %s   (%s)"
+                          % (widget, field, name), C_OK)
+            self._log("%d event binding(s) created and compiled."
+                      % len(result["created"]), C_OK)
+            self._refresh_targets()
+
         def _unbind_selected(self):
             targets = self._selected_target_rows()
             if not targets:
                 self._log("Select target(s) to unbind.", C_WARN)
+                return
+            if targets[0].get("kind") == "event":
+                # Unbind the event on each row's CHOSEN delegate, and only when it
+                # is this field's -- a button bound to another field on the same
+                # delegate is not ours to remove.
+                field = self._selected_field()
+                doomed = []
+                for t in targets:
+                    for ev in t["bound"].get((t["widget"], t["delegate"]), []):
+                        # A delegate may drive several fields; drop only this one's.
+                        if not field or ev["field"] == field["name"]:
+                            doomed.append(ev["event"])
+                if not doomed:
+                    self._log("The selected widget(s) have no event for this "
+                              "field.", C_WARN)
+                    return
+                try:
+                    removed = remove_event_bindings(self._wbp_path, doomed)
+                except Exception as exc:
+                    self._log("Event unbind failed: %s" % exc, C_ERR)
+                    return
+                self._log("Removed %d event binding(s)." % removed, C_OK)
+                self._refresh_targets()
                 return
             dests = [(t["widget"], t["dest"]) for t in targets]
             try:
@@ -2042,9 +4519,11 @@ if not _needs_restart:
 
         @staticmethod
         def _pair_label(pair):
-            """(field, widget, dest) label for either a native tuple or child dict."""
+            """(field, widget, dest) label for a native tuple, child dict or event tuple."""
             if isinstance(pair, dict):
                 return pair["field"], pair["widget"], pair["child_field"]
+            if len(pair) == 3:                 # event: (field, widget, delegate)
+                return pair
             field, widget, _native, prop = pair
             return field, widget, prop
 
@@ -2056,16 +4535,9 @@ if not _needs_restart:
             if target is None:
                 self._log("Pick a target from the dropdown.", C_WARN)
                 return
-            if target[0] == "child":
-                pairs, warnings = match_child_by_suffix(
-                    self._fields, self._child_widgets,
-                    self.field_pattern.currentText().strip(),
-                    self.widget_pattern.currentText().strip(), target[1])
-            else:
-                pairs, warnings = match_by_suffix(
-                    self._fields, self._widgets,
-                    self.field_pattern.currentText().strip(),
-                    self.widget_pattern.currentText().strip(), target[2])
+            pairs, warnings = self._match_for_target(
+                target, self.field_pattern.currentText().strip(),
+                self.widget_pattern.currentText().strip())
             self.log.clear()
             for warning in warnings:
                 self._log("  ! %s" % warning, C_WARN)
@@ -2073,18 +4545,28 @@ if not _needs_restart:
                 self._log("No matching pairs.", C_ERR)
                 self.btn_apply_bulk.setEnabled(False)
                 self._pending_pairs = []
+                self._pending_target = None
                 return
             for pair in pairs:
                 field, widget, dest = self._pair_label(pair)
                 self._log("  %s  →  %s.%s" % (field, widget, dest))
             self._log("%d pair(s) ready. Click Bind All to apply." % len(pairs), C_OK)
             self._pending_pairs = pairs
+            self._pending_target = target[0]   # event pairs bind by a different path
             self.btn_apply_bulk.setEnabled(True)
 
         def _apply_bulk(self):
             if not self._pending_pairs:
                 return
-            self._run_apply(self._pending_pairs)
+            pairs = self._pending_pairs
+            # Event pairs are (field, widget, delegate) and go through the disk
+            # patcher; property pairs go through the engine API. The two are never
+            # mixed -- one target is chosen for the whole batch.
+            if self._pending_target == "event":
+                self._run_create_events(
+                    [(widget, field, delegate) for field, widget, delegate in pairs])
+            else:
+                self._run_apply(pairs)
             self._pending_pairs = []
             self.btn_apply_bulk.setEnabled(False)
 
@@ -2108,30 +4590,30 @@ if not _needs_restart:
 
         # ── create-fields tab ────────────────────────────────────────────────
         def _create_pairs(self):
+            kind, param = _split_create_label(self.create_type.currentText())
             return expand_batch_spec(
-                self.create_name.text(), self.create_type.currentText(),
-                self.create_start.value(), self.create_count.value())
+                self.create_name.text(), kind,
+                self.create_start.value(), self.create_count.value(), param)
 
         def _preview_create(self):
             pairs, error = self._create_pairs()
             self.create_preview.clear()
             if error:
-                self.create_preview.append('<span style="color:%s">%s</span>' % (C_WARN, error))
+                self.create_preview.append(_html(C_WARN, error))
                 if hasattr(self, "btn_create"):
                     self.btn_create.setEnabled(False)
                 return
-            existing = set()
-            if self._wbp_path:
-                existing = {f["name"] for f in self._fields}
+            existing = {f["name"] for f in self._fields} if self._wbp_path else set()
             cat = self.create_category.currentText().strip()
-            lines = ['<span style="color:%s">Will create %d field(s)%s:</span>'
-                     % (C_TX2, len(pairs), (" in category '%s'" % cat) if cat else "")]
-            for name, kind in pairs:
+            lines = [_html(C_TX2, "Will create %d field(s)%s:" % (
+                len(pairs), (" in category '%s'" % cat) if cat else ""))]
+            for name, kind, param in (_field_spec(p) for p in pairs):
+                label = "%s (%s)" % (kind, param) if param else kind
                 if name in existing:
-                    lines.append('<span style="color:%s">  %s : %s   (exists — skipped)</span>'
-                                 % (C_WARN, name, kind))
+                    lines.append(_html(C_WARN, "  %s : %s   (exists — skipped)"
+                                       % (name, label)))
                 else:
-                    lines.append("  %s : %s" % (name, kind))
+                    lines.append("  %s : %s" % (name, label))
             self.create_preview.append("\n".join(lines))
             if hasattr(self, "btn_create"):
                 self.btn_create.setEnabled(True)
@@ -2139,30 +4621,28 @@ if not _needs_restart:
         def _run_create(self):
             if not self._wbp_path:
                 self.create_preview.append(
-                    '<span style="color:%s">Load a Widget Blueprint first.</span>' % C_WARN)
+                    _html(C_WARN, "Load a Widget Blueprint first."))
                 return
             pairs, error = self._create_pairs()
             if error:
-                self.create_preview.append('<span style="color:%s">%s</span>' % (C_ERR, error))
+                self.create_preview.append(_html(C_ERR, error))
                 return
             category = self.create_category.currentText().strip() or None
             try:
                 result = create_verse_fields(self._wbp_path, pairs, category=category)
             except Exception as exc:
-                self.create_preview.append(
-                    '<span style="color:%s">Create failed: %s</span>' % (C_ERR, exc))
+                self.create_preview.append(_html(C_ERR, "Create failed: %s" % exc))
                 return
 
             self.create_preview.clear()
             for name in result["created"]:
-                self.create_preview.append(
-                    '<span style="color:%s">  created  %s</span>' % (C_OK, name))
+                self.create_preview.append(_html(C_OK, "  created  %s" % name))
             for name in result["skipped_existing"]:
                 self.create_preview.append(
-                    '<span style="color:%s">  skipped  %s (already exists)</span>' % (C_WARN, name))
+                    _html(C_WARN, "  skipped  %s (already exists)" % name))
             self.create_preview.append(
-                '<span style="color:%s">Done: %d created, all verified as Verse fields.</span>'
-                % (C_OK, len(result["created"])))
+                _html(C_OK, "Done: %d created, all verified as Verse fields."
+                      % len(result["created"])))
             unreal.log("[VerseBinder] created %d field(s)" % len(result["created"]))
             # Refresh the Bind tab so the new fields show up immediately.
             self._load()
@@ -2174,10 +4654,8 @@ if not _needs_restart:
     def main():
         app = QApplication.instance() or QApplication(sys.argv)
 
-        # ALWAYS re-apply the current stylesheet. The QApplication is shared and
-        # persists across re-runs, so a previously-applied (older) style would
-        # otherwise stick forever — re-running would never reflect edits. Force a
-        # repolish so an already-open window restyles in place.
+        # ALWAYS re-apply the stylesheet: the QApplication persists across
+        # re-runs, so an older style would stick forever otherwise.
         app.setStyleSheet(STYLE)
 
         def _repolish(w):
@@ -2185,24 +4663,28 @@ if not _needs_restart:
             w.style().polish(w)
             w.update()
 
-        # The window ref must live on the persistent QApplication, NOT a module
-        # global — each run execs this file in a fresh namespace, so a module
-        # global is always None and every run would stack a duplicate window.
+        # The window ref lives on the persistent QApplication (each run execs
+        # this file in a fresh namespace, so a module global is always None).
+        # The ref can outlive the window: after the user closes it, ANY call on
+        # the wrapper (even isVisible) raises "Internal C++ object already
+        # deleted" — a dead ref must read as "no window" or reopening breaks.
         win = getattr(app, "_verse_binder_win", None)
-        if win is not None and win.isVisible():
+        try:
+            alive = win is not None and win.isVisible()
+        except RuntimeError:
+            alive = False
+        if alive:
             _repolish(win)
             for child in win.findChildren(QWidget):
                 _repolish(child)
-            win.raise_()
-            win.activateWindow()
+            win._reclaim_focus()
             return
 
         win = VerseBinderWindow()
         app._verse_binder_win = win   # also keeps the window alive (GC anchor)
         win.setWindowFlags(Qt.WindowType.Window)
         win.show()
-        win.raise_()
-        win.activateWindow()
+        win._reclaim_focus()
 
         # Auto-load the Content Browser selection if it's a widget (field then
         # shows just its name). Otherwise the field starts empty — no default path.

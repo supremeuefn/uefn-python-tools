@@ -9,15 +9,19 @@ This document is the authoritative reference for programmatically managing Verse
 ## Table of Contents
 
 1. [Core Concepts](#core-concepts)
-2. [Creating Variables — Correct Method](#creating-variables--correct-method)
-3. [Type Mapping — Pin Types](#type-mapping--pin-types)
-4. [Patching Verse Metadata](#patching-verse-metadata)
-5. [Deleting Variables — Safe Method](#deleting-variables--safe-method)
-6. [Reading Verse Fields](#reading-verse-fields)
-7. [MVVM Bindings](#mvvm-bindings)
-8. [Memory Layout Reference](#memory-layout-reference)
-9. [Critical Warnings — What NOT To Do](#critical-warnings--what-not-to-do)
-10. [Complete Working Examples](#complete-working-examples)
+2. [Saving — `save_asset` demotes your fields](#saving--save_asset-demotes-your-fields)
+3. [Creating Variables — Correct Method](#creating-variables--correct-method)
+4. [Type Mapping — Pin Types](#type-mapping--pin-types)
+5. [Patching Verse Metadata](#patching-verse-metadata)
+6. [Verse Event Fields](#verse-event-fields)
+7. [The crash vice](#the-crash-vice--create-then-unload)
+8. [Deleting Variables — Safe Method](#deleting-variables--safe-method)
+9. [Reading Verse Fields](#reading-verse-fields)
+10. [MVVM Bindings](#mvvm-bindings)
+11. [Event Bindings — the disk layer](#event-bindings--the-disk-layer)
+12. [Memory Layout Reference](#memory-layout-reference)
+13. [Critical Warnings — What NOT To Do](#critical-warnings--what-not-to-do)
+14. [Complete Working Examples](#complete-working-examples)
 
 ---
 
@@ -29,10 +33,46 @@ The workflow is always:
 
 1. **Create** the variable with the correct pin type using the public API.
 2. **Patch** only the Verse metadata (4 entries at offset 200) in memory.
-3. **Compile and save** so the metadata is serialized to disk.
+3. **Compile and save through the tag-regenerating path** so the metadata is serialized to disk.
 4. **Verify** via `VerseClassFields` asset registry tag.
 
 There are no dedicated MCP tools for these operations. All operations must be performed via `execute_python` (running arbitrary Python inside the editor with access to the `unreal` module).
+
+---
+
+## Saving — `save_asset` demotes your fields
+
+> **`EditorAssetLibrary.save_asset` does NOT regenerate the asset-registry tags.** It
+> rewrites the package but leaves `VerseClassFields` exactly as it was. A freshly created
+> and patched Verse field is therefore written out as an **ordinary Blueprint variable**,
+> and is gone the next time the asset is read from disk.
+
+Decisive measurement: live object's tag = 23 fields, asset registry = 23, but the **saved
+file** = 22. Switching to `save_packages` took the file's tag from **22 → 23** immediately.
+
+```python
+def save_regenerating_tags(wbp_path):
+    """The ONLY save that keeps a Verse field a Verse field."""
+    wbp = unreal.EditorAssetLibrary.load_asset(wbp_path)
+    pkg = wbp.get_outermost()
+    pkg.modify()                    # dirty it, or the save is skipped as a no-op
+    unreal.EditorLoadingAndSavingUtils.save_packages([pkg], False)
+```
+
+Use this at **every** save that finishes a create or produces a snapshot for the disk
+patcher. Everywhere this document shows `save_asset` after a metadata patch, read it as
+`save_regenerating_tags`.
+
+**Why this hid for so long:** a *normal editor shutdown* rewrites the tags on the way out.
+Fields created in earlier sessions really were in the saved tag — but only because those
+sessions were closed cleanly. That masks the bug completely and makes a correct diagnosis
+look like a false alarm.
+
+**Verify persistence by reading the tag out of the saved file**, from a *separate* Python
+process (asset-registry blob → decode latin-1 → regex the field names). Do **not** reload
+the package to check (that is the crash vice, below), and do **not** build a proximity
+heuristic ("metadata keys within N bytes of the field name") — it false-negatives on real
+UI-made fields.
 
 ---
 
@@ -120,7 +160,7 @@ bel.add_member_variable(wbp, "VF_MyVariable", pt_material)
 
 ```python
 bel.compile_blueprint(wbp)
-unreal.EditorAssetLibrary.save_asset("/YourProject/UI/WBP_Example")
+save_regenerating_tags(wbp_path)     # NOT save_asset — see "Saving", above
 ```
 
 At this point the variable exists with the correct type but is NOT yet a Verse field. It needs metadata patching (see below).
@@ -328,7 +368,7 @@ for i in range(count):
 
 # 3. Patch each variable
 for name, addr in name_to_addr.items():
-    if name == "BackPointer":
+    if name == "BackPointer":       # shared by every event field — NEVER touch or delete
         continue
 
     block_addr = build_metadata_block(name)
@@ -338,12 +378,12 @@ for name, addr in name_to_addr.items():
     ctypes.c_uint32.from_address(addr + METADATA_OFFSET + 8).value = 4
     ctypes.c_uint32.from_address(addr + METADATA_OFFSET + 12).value = 4
 
-    # Set PropertyFlags = 65541 (required for Verse visibility)
+    # PropertyFlags: 65541 for a plain field, 65557 for an EVENT field
     ctypes.c_uint64.from_address(addr + PROPERTY_FLAGS_OFFSET).value = 65541
 
-# 4. Compile, save, verify
+# 4. Compile, save (tag-regenerating path — NOT save_asset), verify
 bel.compile_blueprint(wbp)
-unreal.EditorAssetLibrary.save_asset(wbp_path)
+save_regenerating_tags(wbp_path)        # see "Saving" — save_asset silently demotes fields
 
 asset_data = unreal.EditorAssetLibrary.find_asset_data(wbp_path)
 fields = asset_data.get_tag_value("VerseClassFields") or ""
@@ -373,6 +413,308 @@ for i in range(meta_count):
 
 ---
 
+## Verse Event Fields
+
+A Verse **event** field (`Type=Event` in `VerseClassFields`) is what a `button.OnClick`
+binding fires into. It is created by the same descriptor patch, with three differences.
+
+**An event field is THREE things:**
+
+1. A member variable named **`VerseFieldInternalVariable_<PublicName>`** — *not* the public
+   name. (This is the single biggest reason people fail to find it.) Its type is an object
+   of class `/Script/VerseTypeEditorRuntime.VerseEvent`.
+2. A **public function graph** named `<PublicName>` (`add_function_graph`).
+3. A shared hidden **`BackPointer`** member of type `/Script/VerseUI.VerseUIUserWidget` —
+   created once per widget, **shared by every event field on it**.
+
+Then the same ctypes metadata patch, but:
+
+| | Plain field | Event field |
+|---|---|---|
+| `PropertyFlags` | `65541` | **`65557`** |
+| Metadata entries | FieldNotify, VerseVariable, DisplayName, VisibilityAccess | + **`Hidden`**, **`EventParameters`** |
+
+> **Remove the function graph before the final save.** `add_function_graph` creates a *bare
+> `FunctionEntry` stub*, and UEFN's `ValkyrieValidator_Blueprints` rejects that as
+> **restricted content** — the asset fails validation and won't cook. The working sequence
+> is: create the graph → let the metadata patch land → **`remove_function_graph` before the
+> final save**. The graph is only needed transiently, to make the engine mint the right
+> descriptor; the field stays a real event without it, and Verse regenerates the graph.
+>
+> Symptom of getting this wrong: the field looks fine in the editor, but the widget fails
+> Data Validation, and the offending member shows up in the details panel under its raw
+> internal name (`Verse Field Internal Variable VF_Foo`) instead of as a proper field.
+>
+> ⚠ **This is a workaround for the stub, NOT a rule that Verse event fields are graphless.**
+> A genuine *editor-made* event field **does** keep a function graph — a real 7-node Verse
+> payload graph (`FunctionEntry → CallFunction → MakeArray/MakeStruct →
+> VariableGet(BackPointer) → FunctionResult`) — and the widget validates fine with it. What
+> the validator rejects is the empty stub, not the concept. (An earlier version of this doc
+> claimed the opposite; measured and corrected.)
+
+### Event parameters (int / float / logic)
+
+An event field can carry **one parameter**, exactly as the MVVM panel offers. It is **not a
+different kind of field**: same `VerseEvent` member, same `65557` flags, same six metadata
+keys. The *only* difference is that `EventParameters` — which a parameterless event leaves
+**empty** — holds a **serialized `EdGraphPinType`**:
+
+| Param | `EventParameters` metadata value |
+|---|---|
+| *(none)* | `""` |
+| int | `(PinCategory="int64",PinSubCategoryMemberReference=(MemberGuid=0…0),PinValueType=())` |
+| float | `(PinCategory="real",PinSubCategory="double",PinSubCategoryMemberReference=(MemberGuid=0…0),PinValueType=())` |
+| logic | `(PinCategory="bool",PinSubCategoryMemberReference=(MemberGuid=0…0),PinValueType=())` |
+
+Write that string as the value of the `EventParameters` entry and the engine does the rest —
+on save it regenerates the tag as `EventParameters=((Type=Integer))` and the field is
+indistinguishable from a UI-made one. **No graph surgery, no payload struct, no new
+descriptor layout.** Verified: a tool-made `event (int)` reads back identical to an editor-made
+one, compiles `BS_UP_TO_DATE`, validates `VALID`, persists to disk, and **binds to a button**.
+
+The pin categories are the same ones used for plain `int`/`float`/`logic` fields, and the
+GUID is zeroed (the compiler resolves it).
+
+**Reading it back:** parse the parameter out of the `VerseClassFields` tag —
+`EventParameters=((Type=Integer))` → `int`. The engine spells the parameter with the same
+Verse type names it uses for a field's own `Type`.
+
+> **Model the parameter as `(name, "event", param)`, not as an `"event_int"` kind.** A
+> codebase that branches on `kind == "event"` (the tool does so in ~20 places: internal-name
+> mapping, BackPointer creation, graph removal, binding, deletion) would need every one of
+> those updated for a sibling kind, and missing one is silent. Keeping `"event"` as the kind
+> and carrying the parameter alongside means all of them stay correct by construction.
+
+### The per-binding parameter VALUE (`Param 0`) — and the crash it caused
+
+The field's `EventParameters` declares the parameter's **type**. The **value each button
+passes** ("this button sends 1, that one sends 2") is stored per *binding*, in the event
+export's `SavedPins` array. Ten buttons can share one `event (int)` field and each pass a
+different number — that is the point of a parameter.
+
+```
+MVVMBlueprintViewEvent_17                        <- one binding (one button)
+  SavedPins  (ArrayProperty)          size @ tag+56    <- 645
+    [0] MVVMBlueprintPin (StructProperty)
+          Id -> PinNames: ["Param0"]
+          Path, DefaultText, DefaultObject, bSplit, Status
+          DefaultString (StrProperty)  size @ tag+20   <- 6
+            = "0"                      count in FString <- 2
+  GraphName
+```
+
+The value is **plain text** — `"7"`, `"2.5"`, `"true"` — which the engine parses back into the
+pin's type. Defaults are `"0"` / `"0.0"` / `"false"`. A parameterless binding has **no
+`SavedPins` at all**, so `SavedPins`' presence is what tells you whether a binding takes a value.
+
+#### The pin is a TEMPLATE — build it, never demand a donor
+
+A clone inherits its template's `SavedPins`, so cloning a plain event onto a parameterised
+field leaves it with nowhere to put the value. The obvious response — "refuse, and tell the
+user to hand-make one parameterised binding in the MVVM panel first" — is a **cop-out**: it
+sends them to do by hand exactly what this tool exists to automate.
+
+**Measured: the `SavedPins` block is identical for every widget AND every param type.** Rewrite
+one type's value into another's block, fix the two sizes, and you reproduce that other
+binding's bytes *exactly*. It encodes nothing about the widget, the field, or even the
+parameter's type — the FIELD's `EventParameters` declares that; the pin only holds a value.
+
+So **synthesize it** (`_build_pin_block` / `_add_pin`). Store it as ops, not a byte blob: the
+block is riddled with FNames, which are *indices into the package's own name map*, so a literal
+copy would point at whatever those indices happen to mean in the target asset. Resolve each
+name through `add_name` (which reparses — so re-locate every offset afterwards).
+
+Verified: a synthesized pin is **byte-identical to the editor's own**, for int, float and logic,
+built onto a plain event that never had one.
+
+#### Two engine behaviours that silently undo the work
+
+Both write correctly to disk and are then reverted by the reload. Neither errors.
+
+**1. A SYNTHESIZED pin's value is regenerated on compile — a cloned one's is not.** Build a pin
+with `_add_pin` and write its value in the same `_patch_on_disk` pass, and the reload flattens it
+back to the default (measured: patcher wrote `'5'`, asset came back `'0'`). A value written into a
+pin the clone *inherited* survives that same compile untouched. So only a synthesized pin needs a
+**second pass** — create the events, let that compile, then set those values in their own patch.
+
+That distinction is worth honouring rather than always paying for two passes: an editor cycle
+(unload → reload → compile → save) costs **~2s and closes the user's widget tab**. Gating the
+second pass on "did we actually build a pin" takes the common case (a donor exists) from 2 passes
+to 1 — measured **4.55s → 2.82s** for a 4-button bind, and the tab closes once instead of twice.
+
+**2. A clone's GRAPH is typed, and the engine trusts it over the patched FName.** Clone an
+`int` binding onto a `float` field and the asset comes back with the field silently re-pointed
+to the int one — the binding is wrong, and nothing complains. So the donor's parameter must
+**match** the field's. A parameterless event is always a safe donor (its graph carries no
+parameter), which is why `_pick_template` prefers a same-typed binding, else a plain one, and
+lets `_add_pin` build the missing pin.
+
+#### Changing the value's LENGTH resizes four fields, not one
+
+`"0"` → `"7"` is the same byte length: a safe in-place overwrite. `"0"` → `"10"` is **one byte
+longer**, and then *all* of these must grow together:
+
+| Field | Where |
+|---|---|
+| the FString's own char count | in the value itself |
+| `DefaultString`'s payload size | its tag **+20** |
+| **`SavedPins`' payload size** | its tag **+56** ← the one that bites |
+| the export's `SerialSize` | export entry +28 |
+
+…plus every file offset past the insertion (`_shift_offsets`).
+
+**`SavedPins` is an ArrayProperty *of structs*, so its size is NOT at +20.** The tag also names
+its inner type (`StructProperty`) and the struct (`MVVMBlueprintPin`) before the size lands at
+**+56**. Reading +20 returns the inner type's bytes decoded as an int (`249`) — plausible-looking
+garbage.
+
+I missed the array size and it **crashed UEFN** on the next reload:
+
+```
+Failed loading tagged ArrayProperty ...MVVMBlueprintViewEvent:SavedPins.
+    Read 646B, expected 645B.
+Serial size mismatch: Got 1880, Expected 1984
+Assertion failed: LinkerLoad.cpp [Line: 5745]
+```
+
+There is **no quiet failure mode** — the package still parses in Python and then kills the
+editor's loader. So verify the enclosure (`array_payload <= default_string < array_payload +
+array_size`) before resizing, rather than trusting that the offsets landed right.
+
+> **Two traps that made this worse, both worth internalising:**
+>
+> 1. **`find_fname` scans for an FName's 8 bytes and gets false positives** inside other
+>    properties' payloads. It is only safe for the in-place FName retargeting it was built
+>    for. My "SavedPins tag" hit decoded as `size=249` with a *package path* as its inner type
+>    — visibly wrong, had I checked.
+> 2. **A self-written parser confirming its own writes proves nothing.** My scratchpad test
+>    passed all six cases — including grow *and* shrink — because it never validated container
+>    sizes. It was the writer grading its own homework. **Only the engine is an honest check.**
+
+#### How to get this right: use UAssetAPI as an oracle (not as a dependency)
+
+`D:\Dev\uassetgui-uefn` is a real UE serializer (.NET, `dotnet build`). A no-op read+write of
+the asset is **byte-identical** to the engine's own output, which makes it a trustworthy
+reference. Use it to *measure*, then keep the shipped tool pure-Python:
+
+1. Have UAssetAPI write the same edit (e.g. `"0"` → `"10"`).
+2. Diff its output against its *unchanged* output — every differing int32 is exactly the set of
+   size/offset fields the edit must touch. That diff is what revealed `SavedPins` +56.
+3. Gate the Python writer on producing **byte-identical** output to UAssetAPI across values that
+   fit, grow (+1, +6), shrink, and go negative.
+
+The tool's writer passes that gate on all nine cases and the editor loads the result
+(`BS_UP_TO_DATE`, `VALID`). UAssetAPI ships nothing — it was the measuring instrument.
+
+### Operations close the widget's editor tab — guard ALL of them
+
+`remove_function_graph` (and the disk patcher's unload) tears down the widget's open editor
+tab. So does **deleting** an event field, not just creating one.
+
+> **Whether the tab closes depends on the DATA, not on which function you called.**
+> `delete_verse_fields` calls `remove_function_graph` *only for event fields* — so deleting
+> a plain field leaves the tab alone while deleting an event field closes it. Testing one
+> case and concluding "delete is fine" is exactly the trap (I fell in it). Deleting a
+> **bound** event field is worse still: it also drops that field's bindings, which runs the
+> disk patcher, closing the tab by a *second* independent route.
+
+> **Reopen ONCE, at the end of the operation — not once per reload.** One click can reload the
+> asset several times (a create that synthesizes pins patches twice; `delete_verse_fields` nests
+> a whole `remove_event_bindings` inside itself). If the reload path reopens the tab each time,
+> the widget visibly slams shut and springs open, twice, for one action. Hold a **counter**
+> (not a flag — guarded calls nest) while an operation is in flight; the reload declines to
+> reopen while it is non-zero, and the outer guard reopens exactly once in its `finally`. The
+> declining reload must **leave** the "was it open" state in place rather than consuming it, or
+> the outer guard no longer knows the tab needs restoring. Likewise, the open/close probe used
+> to *detect* the tab must not spring it back open when the caller is about to close it anyway.
+
+Guard **every** mutating entry point uniformly — create, delete, set-category, and all the
+binding calls — rather than the ones you think need it:
+
+```python
+def keeps_editor_open(operation):
+    @functools.wraps(operation)
+    def wrapper(wbp_path, *args, **kwargs):
+        note_editor_open(wbp_path)
+        was_open = _WAS_EDITOR_OPEN.get(wbp_path, False)
+        try:
+            return operation(wbp_path, *args, **kwargs)
+        finally:
+            _WAS_EDITOR_OPEN[wbp_path] = was_open   # outer guard is authoritative
+            reopen_editor(wbp_path)
+    return wrapper
+```
+
+Two details that matter:
+
+* **The outer guard must keep its own answer.** Nested operations (delete → remove bindings
+  → the patcher's unload/reload) *consume* the shared "was it open" flag, and whether a
+  nested call runs at all depends on the data. Re-asserting it means the tab is restored
+  every time. Reopening an already-open tab is harmless; leaving it closed is not.
+* **Restore on failure too.** A rollback must not cost the user their open widget.
+
+**Reading the tab state:** `AssetEditorSubsystem` has no `find_editor_for_asset` binding.
+The only call that reveals it — `close_all_editors_for_asset`, which **returns the count it
+closed** — also closes it. So probe by closing and immediately reopening.
+
+**Focus:** reopening the widget raises the UEFN window over your tool. Reclaim focus from
+the same wrapper's `finally`, **not** from each call site — handlers `return` early on an
+exception, so per-site calls get skipped exactly when the engine has stolen the foreground.
+
+**Validation check:**
+
+```python
+sub = unreal.get_editor_subsystem(unreal.EditorValidatorSubsystem)
+result, warnings, errors = sub.is_object_valid(wbp, unreal.DataValidationUsecase.MANUAL)
+# result == unreal.DataValidationResult.VALID
+```
+
+---
+
+## The crash vice — create, then unload
+
+`create_verse_fields` ctypes-patches each new variable's `MetaDataArray` to point at
+**your Python buffers**. That leaves the session in a vice, and **both jaws are real**
+(this cost 4 editor crashes and one silently-demoted-field bug to pin down):
+
+- **Don't detach → the GC frees your buffer → the editor dies.** Any later
+  `unload_packages()` / `reload_packages()` / `collect_garbage()` destroys the descriptors,
+  and `TArray`'s destructor calls `FMemory::Free()` on memory UE never allocated →
+  `EXCEPTION_ACCESS_VIOLATION`. It dies *even though* `_KEEP` holds the buffer alive,
+  because UE's allocator asserts on an unknown block. Log signature: `LogGarbage: Collecting
+  garbage` immediately followed by the access violation, with engine frames sitting directly
+  above `python311.dll`.
+- **Detach, then let anything SAVE → the field is silently demoted.** The engine serializes
+  a descriptor's metadata *from the array it points at*, so an emptied array written to disk
+  strips the field. It keeps its name and its `65557` flags but loses its metadata, drops out
+  of `VerseClassFields`, and becomes a plain BP variable. And `unload_packages` **flushes
+  dirty packages** — detaching dirties the package, so the unload itself performs the fatal
+  save. There is **no dirty-flag API** from Python (`Package` has no `is_dirty` /
+  `set_dirty_flag`).
+
+> **The only reliable test for a demoted field is the descriptor's metadata-entry count:
+> a working event field has 6, a demoted one has 0.** The names (`Hidden`,
+> `EventParameters`, the field name) all still linger in the package name map, so grepping
+> for them proves nothing.
+
+**The three rules, and all three must hold:**
+
+1. `create_verse_fields` patches, saves, and **never detaches**. Buffers stay attached for
+   the session; that is safe on its own.
+2. Any `_unload` **must** detach (the crash is not optional) and therefore **will** flush
+   emptied metadata over the asset file. Accept it.
+3. So a disk patcher must **snapshot the file immediately after the last good save, BEFORE
+   the unload, and patch the snapshot** — writing the result over whatever the unload left
+   behind. The naive order (save → unload → read the file) reads an already-stripped file.
+
+> **This bites ad-hoc test and probe scripts just as hard as the tool.** Any script that
+> calls `reload_packages()` / `unload_packages()` / `collect_garbage()` after a create,
+> without detaching first, kills the editor instantly. **To verify persistence, do not
+> reload anything** — read the `VerseClassFields` tag straight out of the saved `.uasset`
+> from a separate Python process. It needs no editor and cannot crash one.
+
+---
+
 ## Deleting Variables — Safe Method
 
 ### The ONLY safe way to delete variables:
@@ -383,7 +725,7 @@ graph_editor = unreal.BlueprintGraphEditor.get_graph_editor_by_name(wbp, "EventG
 graph_editor.remove_member_variable("VF_VariableName")
 
 unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
-unreal.EditorAssetLibrary.save_asset(wbp_path)
+save_regenerating_tags(wbp_path)     # NOT save_asset — see "Saving", above
 ```
 
 > **For a field created THIS session, DETACH its MetaDataArray before deleting** — or
@@ -433,7 +775,7 @@ for name in names_to_delete:
         print(f"Failed to remove {name}: {e}")
 
 unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
-unreal.EditorAssetLibrary.save_asset(wbp_path)
+save_regenerating_tags(wbp_path)     # NOT save_asset — see "Saving", above
 ```
 
 ### `remove_unused_variables` — USE WITH EXTREME CAUTION
@@ -460,6 +802,11 @@ The blob is a parenthesized record format. Each field is wrapped in `(Name="..."
 ---
 
 ## MVVM Bindings
+
+> **Scope:** this section covers **property** bindings (Verse field → widget property),
+> which are authored through the `unreal` API. **Event** bindings (button → Verse event
+> field) are a different mechanism entirely and cannot be authored this way — see
+> [*Event Bindings — the disk layer*](#event-bindings--the-disk-layer).
 
 ### Reading existing bindings:
 
@@ -573,7 +920,7 @@ arr[-1].import_text(binding_str)                 # fill it
 view.set_editor_property('bindings', arr)        # write the ARRAY back
 
 unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
-unreal.EditorAssetLibrary.save_asset(wbp_path)
+save_regenerating_tags(wbp_path)     # NOT save_asset — see "Saving", above
 ```
 
 > **`set_editor_property('source_path', ...)` does NOT work** — `SourcePath` is
@@ -639,7 +986,7 @@ for i in range(2, 6):
 
 view.set_editor_property("bindings", existing + new_structs)   # write whole array back
 unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
-unreal.EditorAssetLibrary.save_asset(wbp_path)
+save_regenerating_tags(wbp_path)     # NOT save_asset — see "Saving", above
 ```
 
 > **Build standalone `unreal.MVVMBlueprintViewBinding()` structs and append them** — do
@@ -746,7 +1093,7 @@ bindings_list[-1].import_text(formatted_binding_str)
 view.set_editor_property("bindings", bindings_list)
 
 bel.compile_blueprint(wbp)
-unreal.EditorAssetLibrary.save_asset(wbp_path)
+save_regenerating_tags(wbp_path)     # NOT save_asset — see "Saving", above
 ```
 
 ### Key binding fields:
@@ -801,6 +1148,173 @@ Export the **child widget** (e.g. `WBP_Slot`) to T3D and parse its `NewVariables
 
 ---
 
+## Event Bindings — the disk layer
+
+A **property** binding (Verse field → widget property) is authored through the `unreal` API,
+above. An **event** binding (a button's `OnClicked` → a Verse event field) cannot be:
+generation runs entirely in the editor's internal C++ `FMVVMBlueprintViewEvent` path, which
+populates a compiled `MVVMViewClass` table that has **no Python binding at all**. Proven
+exhaustively: a Python-authored event with **byte-identical** `EventPath`/`DestinationPath`
+to a working UI-made one still gets `event_key=(Index=-1)` and
+`[Compiler] Event '...': The event could not be generated.`
+
+**But the generated result is just serialized data in the `.uasset`.** So you don't
+generate — you patch the file on disk. Pure Python, no .NET, no UAssetGUI, no `.usmap`.
+Create, retarget, and remove all work and are editor-verified (`BS_UP_TO_DATE`, `VALID`).
+
+### Package format (UEFN = UE 5.8)
+
+- `FileVersionUE4=522`, `FileVersionUE5=1018`, `LegacyFileVersion=-9`.
+- Header order: tag, legacy, UE3, UE4ver, UE5ver, licensee, **SavedHash (20 bytes)**,
+  **SectionSixOffset**, then custom versions, FolderName… (SavedHash replaced PackageGuid;
+  TotalHeaderSize folded into SectionSixOffset). SavedHash is **not verified** on load.
+- Export table stride = **112 bytes**. `FObjectImport` is a **fixed 40-byte** record with
+  ObjectName at **+20** — do *not* "derive" the stride by testing whether name indices look
+  plausible; a smaller stride also passes and silently reads half the table.
+- Package indices: imports are negative — the Nth import is `-(N+1)`. **Import indices are
+  not stable** (adding a name or import renumbers them). Never hardcode; resolve by class
+  name every time.
+- **The property stream is NOT int32-aligned.** Variable-length tag data puts FNames at
+  arbitrary byte offsets, so a strided scan cannot find them. Locate the *tag*, then derive:
+  a **NameProperty's value sits exactly 25 bytes past its name tag**.
+- All event values (widget, delegate, Verse field, graph name) are FNames = 8 bytes, so
+  **retargeting never changes file length** — no offsets, sizes or hashes need fixing.
+
+### Growing the package (creating an event) — everything you must maintain
+
+Cloning an event export means maintaining every derived structure. Each of these was found
+via a distinct engine failure:
+
+1. **Summary table offsets** — all of import/export/depends/cell_export/cell_import/metadata/
+   soft_package_refs/searchable_names/thumbnail_table/import_type_hierarchies/asset_registry/
+   preload_dependency, plus SectionSix (int32) and BulkDataStart + PayloadToc (int64).
+   Zero means *absent* — never shift a zero.
+2. **`AssetRegistryDependencyDataOffset`** — an int64 **inside** the registry blob (its first
+   8 bytes). Miss → *"Package is unloadable. Reason: SerializeAssetRegistryDependencyData"*.
+3. **Thumbnail table per-entry data offsets** — each entry is (FString class, FString path,
+   int32 absolute offset). Miss → *"Requested read of 33554432 bytes"* at a fixed old address.
+4. **Depends table** — one entry per export; a new export needs an appended `0`.
+5. **`FGenerationInfo`** — must bump with export_count / name_count.
+6. **ArrayProperty tag Size** when growing the `Events` array — sits at `count_pos − 5`
+   (count at `tag + 37`); must equal `4 + count × 4`. Miss → the loader reads one element short.
+7. Export `SerialSize`/`SerialOffset`; export bodies must tile exactly to BulkDataStart.
+8. **Reparse between successive shifts** — parsed Export objects go stale after a shift; a
+   second shift comparing stale offsets corrupts the file.
+9. `"Events"` occurs as an FName in **both** `MVVMBlueprintView` (editable) and
+   `MVVMViewClass` (compiled). Name the owner explicitly; never scan.
+
+### ⚠ `MemberParent` — the delegate's DECLARING class
+
+The one that costs hours. `EventPath`'s **`MemberParent`** is an ObjectProperty holding the
+package index of the class that **declares the delegate** — and that differs *per delegate,
+not per widget*:
+
+- A UEFN button (`UEFN_Button_Quiet/Regular/Loud`, Blueprints under `/Game/Valkyrie/UMG/`)
+  **inherits** `OnButtonBaseClicked` from **`CommonButtonBase`**, but **declares**
+  `OnButtonCTAHighlight`/`Unhighlight` on **itself**.
+- The Custom Button (`/Script/UIFramework.UIFrameworkCustomButtonWidget`, a **native** class)
+  declares its own `OnButtonClicked` / `OnButtonHighlight` / `OnButtonUnhighlight`.
+
+A clone keeps its template's `MemberParent`, so a UEFN-button template retargeted onto a
+Custom Button tells the engine to look for `OnButtonClicked` on `CommonButtonBase` → not
+found → `<None>`:
+
+```
+[Compiler] Event 'Custom Button.<None> => Self.VF Event Field()': The event could not be generated.
+```
+
+- The value sits at **`MemberParent` tag + 25** (same `_NAME_VALUE_GAP` as an FName's).
+- The **first** `MemberParent` is EventPath's; the **second** is DestinationPath's — do not touch it.
+- **The two button shapes spell the same event differently.** Pairing the wrong spelling with
+  a widget silently writes a broken event whose only symptom is a log-only warning — the
+  compile still reports `BS_UP_TO_DATE`. **Validate the `(widget, delegate)` pair against what
+  the widget actually declares, and refuse before writing anything.**
+
+| Panel label | UEFN button | Custom Button |
+|---|---|---|
+| On Clicked | `OnButtonBaseClicked` | `OnButtonClicked` |
+| On Hovered | `OnButtonBaseHovered` | `OnHovered` |
+| On Highlight | `OnButtonCTAHighlight` | `OnButtonHighlight` |
+
+### Which widgets can source an event — gate on the DELEGATE, never on a class list
+
+**Only buttons can.** An Image or a TextBlock declares no delegate — and offering one a
+delegate is **not a cosmetic bug: binding it crashes the editor outright**
+(`EXCEPTION_ACCESS_VIOLATION reading 0xffffffffffffffff` — the engine dereferences a delegate
+the class does not have).
+
+Keep a widget only if its **CDO really declares** the delegate. Delegates are reflected as
+snake_case on the CDO (`on_button_base_clicked`); a **real** delegate reads back as a delegate
+object, while an unbound `UWidget` python method reads back as
+`builtin_function_or_method_with_closure` — that is the test.
+
+MVVM offers exactly **seven** events (Clicked, Hovered, Selected, Unhovered, Unselected,
+Highlight, Unhighlight) even though the class declares ~19 (Double Clicked, Focused, Lock
+Clicked, drag/drop…). Discovery alone over-lists — intersect an allowlist with what the class
+declares. The Custom Button genuinely has no Selected/Unselected.
+
+### Seeding the first event — no UI-made template needed
+
+Cloning needs a template, so this used to require the user to hand-author the first event
+binding in the MVVM panel. **That limitation is gone** — the engine will build the seed for you:
+
+1. **`MVVMEditorSubsystem.add_event(wbp)`** appends a real `MVVMBlueprintViewEvent` **export**
+   *and* registers it in the view's `Events` array. This is the part that cannot be hand-rolled
+   cheaply: a virgin `MVVMBlueprintView` **omits the `Events` property entirely** (UE never
+   serializes a property at its default), so there is no array for the byte patcher to grow.
+   (`add_event` cannot *generate* an event — but it does persist and register the shell, which
+   is all the patcher needs.)
+2. **`import_text` on `event_path` / `destination_path`.** Both are `[Read-Only]` and
+   `set_editor_property` is refused — but **`get_editor_property` on a UObject hands back the
+   LIVE struct**, so `import_text` mutates the event in place and the values *do* reach disk.
+   (Same door as `MVVMBlueprintViewBinding.SourcePath`.) Point them at placeholders; the
+   patcher retargets every FName before the engine ever reads the file.
+3. **`graph_name` is `[Read-Only]` with no such door.** It stays `None`, and an unset FName is
+   **not serialized at all**. Inject the tag on disk — exactly **33 bytes**:
+   `[FName "GraphName"][FName "NameProperty"][int32 ArrayIndex=0][int32 size=8][byte flags=0][FName value]`.
+   - **Where:** the event's property stream ends with an FName `None` followed by a **4-byte
+     trailer**. Write the tag *at* that terminator (so `None` still terminates). Locate it via
+     `n + 8 + 4 == end`. Anchor on the terminator, **not** on `EventKey` — the shell has no
+     `EventKey` tag either (also default/unset).
+
+The seed carries placeholder names, so **retarget it in place** into the first requested
+binding rather than cloning-then-deleting it — deleting an export would mean shrinking the
+export table *and* the Events array, a whole class of surgery avoided for nothing.
+
+**`add_event` and the declaring-class lookup must both run BEFORE the unload** — they load the
+asset, and doing that afterwards re-pins the file the patcher is about to write.
+
+### ⚠ The file lock: never load the asset after the unload
+
+`pkg.save()` → `PermissionError`. The file is **not** read-only (`os.access` says writable) —
+the engine holds an **exclusive handle** whenever the package is loaded, so the only meaningful
+test is trying to `open(path, "r+b")`. Anything that loads the asset *after* the unload re-pins
+it and breaks the patch. **Resolve everything the patcher needs before unloading.**
+
+Beware: a failed patch leaves the package dirty **and** the file locked, so the *next* attempt
+fails too and it looks like a different bug.
+
+### Two snapshots, and don't confuse them
+
+Because seeding *mutates the asset*, a disk patcher needs **two** copies:
+
+- **`backup`** — taken **before** the seed. The rollback target, so a failure undoes the seed
+  too rather than stranding a broken placeholder event.
+- **`working`** — taken **after** the seed. This is what gets parsed and patched, so the patcher
+  sees what the seed produced.
+
+Parsing the pre-seed `backup` fails with a bare `StopIteration` — the seed export simply is not
+in that file.
+
+### Offline verification
+
+**A pristine engine file round-trips byte-identical** through a correct parser. So: patch a file,
+re-parse it, re-serialize it, and require byte-identity. This catches whole classes of
+table-maintenance bugs (it caught the thumbnail-offset and depends-table bugs above as a 3-byte
+diff). Run it from a **separate process** — no editor needed, and it cannot crash one.
+
+---
+
 ## Memory Layout Reference
 
 ```
@@ -828,13 +1342,16 @@ MetaDataArray Entry (32 bytes):
 │            capacity(4) = 16 bytes   │
 └─────────────────────────────────────┘
 
-NewVariables TArray (at UObject + 448):
+NewVariables TArray (at UObject + NEWVARS_OFFSET — PROBE IT, build-specific):
 ┌─────────────────────────────────────┐
 │ ptr to data (8 bytes)               │
 │ count (4 bytes)                     │
 │ capacity (4 bytes)                  │
 └─────────────────────────────────────┘
 ```
+
+`PropertyFlags` (offset 176): **65541** = plain Verse field, **65557** = Verse *event* field.
+A demoted field keeps its flags but has **0** metadata entries — a healthy event field has **6**.
 
 ---
 
@@ -904,6 +1421,40 @@ for anything the UI consumes), never by reading back your own write.
 `"color"`, `"linearcolor"`, `"linear_color"` all return a `PinCategory="int"` pin
 rather than raising. Anything not in the basic-type table must go through
 `import_text`, and you should assert on the resulting `PinCategory`.
+
+### 13. NEVER finish a create with `save_asset` — it demotes the field
+
+It does not regenerate the `VerseClassFields` tag, so the field is written out as a plain
+Blueprint variable and vanishes on the next read from disk. Use `save_regenerating_tags`
+(`pkg.modify()` + `EditorLoadingAndSavingUtils.save_packages`). See [*Saving*](#saving--save_asset-demotes-your-fields).
+
+### 14. NEVER delete `BackPointer`
+
+It is **shared by every Verse event field** on the widget. Deleting it breaks *all* of them
+(`BS_ERROR`: "This blueprint (self) is not a VerseUIUserWidget, therefore ' Target ' must have
+a connection"), and **recreating the variable does not repair it** — the graphs' connections
+are severed, not the variable. The only fix is restoring the `.uasset` from a backup. It sits
+in the member list looking like a leftover; it is not.
+
+### 15. NEVER let an event field persist its function graph
+
+`add_function_graph` creates a genuine *saved* BP function, which UEFN's
+`ValkyrieValidator_Blueprints` rejects as **restricted content**. Create the graph, let the
+metadata patch land, then `remove_function_graph` **before the final save**.
+
+### 16. NEVER unload/reload/GC after a create without detaching first
+
+Instant `EXCEPTION_ACCESS_VIOLATION`. And detaching then saving silently demotes the field.
+Both jaws are real — see [*The crash vice*](#the-crash-vice--create-then-unload). This applies
+to your throwaway probe scripts too, not just to the tool.
+
+### 17. NEVER offer a delegate to a widget that doesn't declare it
+
+Binding an event to an Image or TextBlock **crashes the editor outright**
+(`EXCEPTION_ACCESS_VIOLATION reading 0xffffffffffffffff`). And pairing a button with the *other*
+button shape's spelling of an event (`OnButtonCTAHighlight` vs `OnButtonHighlight`) silently
+writes a broken binding — the compile still says `BS_UP_TO_DATE`, with only a log-line warning.
+Gate on what the CDO actually declares, and validate the pair before writing.
 
 ---
 
@@ -1014,7 +1565,7 @@ for slot in range(1, 6):
         bel.add_member_variable(wbp, f"VF_Slot{slot}{suffix}", pt)
 
 bel.compile_blueprint(wbp)
-unreal.EditorAssetLibrary.save_asset(wbp_path)
+save_regenerating_tags(wbp_path)     # NOT save_asset — see "Saving", above
 
 # --- Step 2: Patch Verse Metadata ---
 # (use the patching procedure from the "Patching Verse Metadata" section above)
@@ -1037,5 +1588,5 @@ for name in to_delete:
     graph_editor.remove_member_variable(name)
 
 unreal.BlueprintEditorLibrary.compile_blueprint(wbp)
-unreal.EditorAssetLibrary.save_asset(wbp_path)
+save_regenerating_tags(wbp_path)     # NOT save_asset — see "Saving", above
 ```
