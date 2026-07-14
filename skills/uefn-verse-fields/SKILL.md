@@ -216,6 +216,16 @@ which need an MVVM conversion *node*.
   source lives on a pin of the conversion node's `EdGraph`. Don't report them as sourceless.
 - **No conversion needed** (bindable directly from Python): `message`→`Text`,
   `color`/`color_alpha`→`ColorAndOpacity`, `float`→`RenderOpacity`.
+- **The UEFN buttons (Loud/Quiet/Regular) bind `Text`** — their label, no conversion. They
+  are **not** UMG widgets: they derive from `FortCTAButton`, which lives in
+  **`/Script/FortniteUI`**, so their `MemberParent` is not the usual `/Script/UMG.…` — a
+  hardcoded UMG prefix silently produces a parent that won't resolve. And because a button
+  is a `UserWidget`, it *declares* `Text` but *inherits*
+  `ColorAndOpacity`/`RenderOpacity`/`Visibility`/`IsEnabled` from `UUserWidget`; naming
+  `FortCTAButton` as the parent of a property it does not declare won't resolve either.
+  `Text` is the only property the editor offers on a button — offer only that. The plain
+  **Custom Button** is a different lineage and has no `Text` at all. See *The UEFN buttons
+  bind `Text`* in the reference.
 - **Conversion required**: `logic`→`Visibility`, `texture`→`Brush`, `material`→`Brush`.
 - `texture`/`material`→`Brush` use MVVM conversion **nodes** (`MVVMK2Node_MakeBrushFrom…`),
   not functions, and **cannot be created from Python** — do them in the editor UI.

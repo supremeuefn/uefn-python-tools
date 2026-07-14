@@ -903,6 +903,50 @@ Likewise `message`/`text` → `TextBlock.Text` and `float` → `RenderOpacity` n
 conversion. Conversion is required for: `logic` → `Visibility`,
 `texture` → `Brush`, `material` → `Brush`.
 
+### The UEFN buttons bind `Text` — and they are NOT UMG widgets
+
+The **Loud / Quiet / Regular** buttons (`UEFN_Button_Loud_C`, …) expose their label as a
+bindable `Text`, so `message` → `Text` works on them exactly as on a `TextBlock`, with no
+conversion. Easy to miss, because a button is not one of the UMG widget types:
+
+```
+UEFN_Button_{Loud,Quiet,Regular}_C
+  └─ FortCTAButton      <- declares Text; lives in /Script/FortniteUI
+       └─ UIKitModularButton -> CommonButtonBase -> CommonUserWidget -> UserWidget -> Widget
+```
+
+Resolve the base with `isinstance(cdo, unreal.FortCTAButton)` — the CDO's Python MRO
+follows the real C++ ancestry. Two traps follow from that ancestry:
+
+- **`FortCTAButton` is in `/Script/FortniteUI`, not `/Script/UMG`.** The `MemberParent`
+  class path is *not* the usual UMG one:
+  ```
+  MemberParent="/Script/CoreUObject.Class'/Script/FortniteUI.FortCTAButton'",MemberName="Text"
+  ```
+  Hardcoding a `/Script/UMG.%s` prefix (the obvious shortcut, since every other bindable
+  widget is UMG) silently produces a `MemberParent` that will not resolve.
+
+- **A button is a `UserWidget`, so most of its properties are INHERITED.** It declares
+  `Text` itself, but reflects `ColorAndOpacity`, `RenderOpacity`, `Visibility` and
+  `IsEnabled` from `UUserWidget`. Naming `FortCTAButton` as the `MemberParent` of a
+  property it does not declare will not resolve. The editor offers **only `Text`** on a
+  button — mirror that and don't offer the rest.
+
+The plain **Custom Button** (`UIFrameworkCustomButtonWidget`) is a different lineage
+(`Button` → `ContentWidget` → `PanelWidget`), is **not** a `FortCTAButton`, and has **no
+`Text`** at all — reflecting `text` off its CDO raises. It correctly has no Text target.
+
+Verify a hand-built binding by diffing it against one made in the editor UI: for the same
+field/widget/property they should be **byte-identical**, and the blueprint must compile
+`BS_UP_TO_DATE`. A `MemberParent` that fails to resolve is exactly the kind of error that
+still serializes into the bindings array and only surfaces at compile.
+
+> Same trap as `EventPath.MemberParent` in
+> [*`MemberParent` — the delegate's DECLARING class*](#-memberparent--the-delegates-declaring-class):
+> `MemberParent` always names the class that **declares** the member, and on these buttons the
+> declaring class is rarely the leaf. There it's the class declaring the *delegate*; here, the
+> *property*.
+
 ### Creating a binding — VERIFIED WORKING
 
 Only for bindings that need **no conversion function** (see the conversion section:
