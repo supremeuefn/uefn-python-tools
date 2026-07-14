@@ -3875,7 +3875,7 @@ if _ready:
         def _build_footer(self):
             """Credit + repo link on the left, version on the right."""
             footer = QHBoxLayout()
-            footer.setContentsMargins(4, 0, 4, 0)
+            footer.setContentsMargins(6, 4, 6, 2)
 
             # QLabel rich text gives real clickable hyperlinks; openExternalLinks
             # hands the URL to the OS browser (no handler wiring needed).
@@ -3886,10 +3886,11 @@ if _ready:
                 % (_AUTHOR_URL, C_ACC, _AUTHOR, _REPO_URL, C_ACC))
             credit.setOpenExternalLinks(True)
             credit.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
-            credit.setStyleSheet("color:%s; font-size:11px;" % C_TX2)
+            credit.setStyleSheet("color:%s; font-size:14px;" % C_TX2)
 
             version = QLabel("v%s" % __version__)
-            version.setStyleSheet("color:%s; font-size:11px;" % C_TX2)
+            version.setStyleSheet(
+                "color:%s; font-size:14px; font-weight:600;" % C_TX0)
             version.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
             footer.addWidget(credit)
