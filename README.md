@@ -13,10 +13,14 @@ PySide6. Run it inside UEFN via `execute_python`.
 ### What it does
 
 - **Bind** — bulk-bind a widget's Verse fields to engine widget properties (Text,
-  ColorAndOpacity, RenderOpacity, …) or to the Verse fields of embedded child-widget
-  instances, all at once.
+  ColorAndOpacity, RenderOpacity, …), to the Verse fields of embedded child-widget
+  instances, or to **button events** (OnClicked, OnHovered, …), all at once.
+- **Event parameters** — an event field can take one `int`, `float`, or `logic`
+  parameter, and *each binding carries its own value*. Select ten buttons, type a
+  starting number, and they bind to the same event field passing 1, 2, 3, … — so one
+  Verse handler can tell which button called it.
 - **Create Fields** — add Verse fields of any supported type (float, int, logic, string,
-  message, color, color_alpha, material, texture), organized into categories.
+  message, color, color_alpha, material, texture, event), organized into categories.
 - **Manage Fields** — edit a field's category or delete it. Deletion is crash-safe (a
   naive delete of a freshly-created field will crash UEFN; this tool handles it).
 
@@ -25,6 +29,11 @@ PySide6. Run it inside UEFN via `execute_python`.
 Creating and binding Verse fields on a Widget Blueprint normally means memory-patching the
 editor by hand — error-prone and easy to crash UEFN. This tool wraps the whole
 create → patch → compile → verify → bind workflow behind a UI.
+
+Event bindings can't be authored through the engine API at all (the next compile discards
+them), so the tool patches the saved `.uasset` directly and reloads it. That's pure Python —
+no external binary, no .NET dependency. Every byte it writes was verified against a real UE
+serializer until the output was identical to what the editor itself produces.
 
 ### Limitations
 
@@ -66,8 +75,14 @@ Python — including every trap that will crash UEFN if done wrong.
 
 ## ⚠️ Warning
 
-These tools memory-patch live UEFN editor state via `ctypes`. Use at your own risk, and
-save your work first.
+These tools memory-patch live UEFN editor state via `ctypes`, and event bindings rewrite the
+saved `.uasset` on disk. Use at your own risk, and save your work first. Every on-disk edit
+takes a timestamped backup to `Saved/VerseBinderBackups/` first, and rolls back on failure.
+
+## Credits
+
+Thanks to [@Benjf29](https://github.com/Benjf29) (Benjamin Ferellec), who pointed us
+toward UAssetGUI — the lead that made the event-binding side of this possible.
 
 ---
 
