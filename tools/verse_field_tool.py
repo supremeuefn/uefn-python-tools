@@ -405,7 +405,18 @@ if not _needs_restart:
         ("color_alpha", "SlateColor"), ("color_alpha", "LinearColor"),
     }
 
-    _CLASS_PATH = "/Script/CoreUObject.Class'/Script/UMG.%s'"
+    _CLASS_PATH = "/Script/CoreUObject.Class'%s'"
+
+    # Module each declaring class lives in. Most UMG widgets are /Script/UMG, but
+    # the UEFN buttons are FortCTAButton (/Script/FortniteUI) and they inherit
+    # ColorAndOpacity from UUserWidget rather than declaring it themselves.
+    _CLASS_MODULE = {
+        "FortCTAButton": "/Script/FortniteUI",
+    }
+
+    def _class_path(class_name):
+        module = _CLASS_MODULE.get(class_name, "/Script/UMG")
+        return _CLASS_PATH % ("%s.%s" % (module, class_name))
 
     # The native class that DECLARES each property, for MemberParent.
     _DECLARING_CLASS = {
@@ -413,6 +424,17 @@ if not _needs_restart:
         "Brush": "Image",
         # ColorAndOpacity is declared on both TextBlock (SlateColor) and Image
         # (LinearColor) — resolved per widget in _declaring_class().
+    }
+
+    # A button is a UserWidget, so it declares Text itself (on FortCTAButton) but
+    # INHERITS ColorAndOpacity from UUserWidget. Naming FortCTAButton as the parent
+    # of a property it does not declare makes the binding fail to resolve, so the
+    # per-widget overrides win over _DECLARING_CLASS.
+    _DECLARING_CLASS_BY_WIDGET = {
+        "FortCTAButton": {
+            "Text": "FortCTAButton",
+            "ColorAndOpacity": "UserWidget",
+        },
     }
 
     # Inherited from UWidget: MemberParent is omitted, bSelfContext=True instead.
@@ -434,7 +456,20 @@ if not _needs_restart:
     # UEFN exposes a REDUCED widget set — ProgressBar/Button/Border from vanilla
     # UMG are hidden in the UEFN designer, so we don't offer them. Text comes
     # through UEFN_TextBlock (a Blueprint over TextBlock; _native_base resolves it).
-    _NATIVE_WIDGETS = ("TextBlock", "Image")
+    #
+    # FortCTAButton is the base of the UEFN Loud/Quiet/Regular buttons, which expose
+    # a bindable Text (the button's label). Order matters: _native_base takes the
+    # FIRST match, and a button is not a TextBlock/Image, so there is no ambiguity.
+    # The plain Custom Button (UIFrameworkCustomButtonWidget) is NOT a FortCTAButton
+    # and has no Text — it correctly stays out of the property list.
+    _NATIVE_WIDGETS = ("TextBlock", "Image", "FortCTAButton")
+
+    # Properties each native base may bind. Absent => every prop it reflects.
+    # A button reflects ColorAndOpacity/RenderOpacity/Visibility/IsEnabled from
+    # UUserWidget, but the editor only offers Text on it, so we mirror that.
+    _WIDGET_PROPS = {
+        "FortCTAButton": ("Text",),
+    }
 
     # ToolTipText is intentionally omitted — it type-matches `message`/`string`
     # (value type Text) and would clutter the target list with a non-visual prop.
@@ -484,6 +519,9 @@ if not _needs_restart:
         """Class to name in MemberParent, or None if inherited from UWidget."""
         if prop_name in _UWIDGET_INHERITED:
             return None
+        by_widget = _DECLARING_CLASS_BY_WIDGET.get(native)
+        if by_widget and prop_name in by_widget:
+            return by_widget[prop_name]
         if prop_name == "ColorAndOpacity":
             return native
         return _DECLARING_CLASS.get(prop_name, native)
@@ -549,8 +587,11 @@ if not _needs_restart:
             cdo = unreal.get_default_object(cls)
         except Exception:
             return {}
+        allowed = _WIDGET_PROPS.get(native)
         found = {}
         for prop in _BINDABLE_PROPS:
+            if allowed is not None and prop not in allowed:
+                continue
             try:
                 value = cdo.get_editor_property(_snake(prop))
             except Exception:
@@ -689,6 +730,9 @@ if not _needs_restart:
         "UEFN_Button_Quiet_C": "UEFN Button Quiet",
         "UEFN_Button_Regular_C": "UEFN Button Regular",
         "UEFN_Button_Loud_C": "UEFN Button Loud",
+        # Property bindings key on the NATIVE base, so the bulk-target dropdown and
+        # the targets table see FortCTAButton rather than the leaf UEFN_Button_*_C.
+        "FortCTAButton": "UEFN Button",
     }
 
     def _widget_class_label(native):
@@ -818,7 +862,7 @@ if not _needs_restart:
             dest_ref = 'MemberName="%s",bSelfContext=True' % member
         else:
             dest_ref = 'MemberParent="%s",MemberName="%s"' % (
-                _CLASS_PATH % declaring, member)
+                _class_path(declaring), member)
         return _binding_from_parts(field_name, field_guid, widget_name, dest_ref, binding_id)
 
     def _binding_string_child(field_name, widget_name, child_class_path,
@@ -3305,6 +3349,8 @@ if not _needs_restart:
     _BULK_PROPS = {
         "TextBlock": ["Text", "ColorAndOpacity", "RenderOpacity"],
         "Image": ["ColorAndOpacity", "RenderOpacity"],
+        # The UEFN Loud/Quiet/Regular buttons: their label, same as the editor offers.
+        "FortCTAButton": ["Text"],
     }
 
     def _html(color, text):
@@ -3771,8 +3817,9 @@ if not _needs_restart:
                     for prop in _BULK_PROPS[cls]:
                         if not any(is_direct_bindable(t, cls, prop) for t in props):
                             continue
-                        self.target_combo.addItem("%s · %s" % (cls, prop),
-                                                  ("native", cls, prop))
+                        self.target_combo.addItem(
+                            "%s · %s" % (_widget_class_label(cls), prop),
+                            ("native", cls, prop))
                 # Sub-widget fields: bind field-to-field, so the types must match.
                 for name in sorted({f["name"] for c in self._pattern_children()
                                     for f in c["fields"] if f["type"] in props}):
@@ -4167,7 +4214,10 @@ if not _needs_restart:
             self.tbl_targets.setRowCount(len(rows))
             for r, row in enumerate(rows):
                 self.tbl_targets.setItem(r, 0, QTableWidgetItem(row["widget"]))
-                self.tbl_targets.setItem(r, 1, QTableWidgetItem(row["native"]))
+                # CLASS is cosmetic — show "UEFN Button", not FortCTAButton. The row's
+                # own `native` stays the real class; the binding resolves through it.
+                self.tbl_targets.setItem(
+                    r, 1, QTableWidgetItem(_widget_class_label(row["native"])))
                 prop_item = QTableWidgetItem(row["dest"])
                 if not row["bindable"]:
                     prop_item.setForeground(QColor(C_TX2))

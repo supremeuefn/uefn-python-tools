@@ -52,6 +52,9 @@ shown locked.
   *"a conversion function is required"*. Same-type only.
 - ✅ Works without conversion: `message`/`string` → `Text`, `color`/`color_alpha` →
   `ColorAndOpacity`, `float` → `RenderOpacity`, `logic` → `IsEnabled`.
+- ✅ The UEFN **buttons** (Loud / Quiet / Regular) expose their label as `Text`, so a
+  `message` field binds straight to it — the same binding the editor's Text field makes.
+  It's the button's only bindable property; the plain Custom Button has no `Text` at all.
 - ✅ **Field-to-field bindings work for every type, including `texture`.** A parent field
   bound to an embedded child widget's same-type Verse field is plain property-to-property.
   The usual pattern: do the Brush conversion *inside* the child widget once, in the editor
@@ -60,7 +63,8 @@ shown locked.
 Other limits:
 
 - Only Widget Blueprints. Bind targets cover the widget types UEFN actually exposes
-  (`TextBlock`, `Image`); unbindable engine properties like `ToolTipText` are hidden.
+  (`TextBlock`, `Image`, and the Loud/Quiet/Regular buttons); unbindable engine
+  properties like `ToolTipText` are hidden.
 - **Category order can't be changed.** It follows the order categories were first used, and
   the underlying array can't be safely patched. The order is cosmetic.
 - Deleting a field also drops MVVM bindings that use it as a source.
