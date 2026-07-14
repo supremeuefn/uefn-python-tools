@@ -1,7 +1,8 @@
 """Verse Fields + Binding Tool — create, manage, and bulk-bind Verse fields via MVVM.
 
 Standalone single-file tool: needs the editor's `unreal` module, the stdlib, and
-PySide6 (auto-installed on first run — restart UEFN once after). Run inside UEFN:
+PySide6 — auto-installed on first run behind a Tk progress window, then the tool
+opens straight away (no console, no UEFN restart). Run inside UEFN:
     Tools > Execute Python Script...  ->  verse_field_tool.py
 
 Binds Verse fields to ENGINE PROPERTIES (Text, ColorAndOpacity, ...), to
@@ -42,50 +43,321 @@ def _find_ue_python():
     return None
 
 
-def _ensure_deps():
-    import subprocess
-    import unreal
-
+def _pyside_importable():
+    """True if PySide6 is really usable — probe the SUBMODULE, not a stale cache."""
     try:
-        from PySide6 import QtWidgets  # noqa: F401  (probe the submodule, not a stale cache)
-        return
+        from PySide6 import QtWidgets  # noqa: F401
+        return True
     except (ImportError, AttributeError):
-        pass
+        return False
 
-    # A half-imported PySide6 poisons the cache; clear it so the fresh install loads.
+
+def _clear_pyside_cache():
+    """A half-imported PySide6 poisons sys.modules; drop it so a fresh install loads."""
     for key in list(sys.modules):
-        if key == "PySide6" or key.startswith("PySide6.") \
-                or key == "shiboken6" or key.startswith("shiboken6."):
+        if key.split(".", 1)[0] in ("PySide6", "shiboken6"):
             del sys.modules[key]
 
-    unreal.log_warning("[VerseBinder] PySide6 missing. Installing...")
+
+# pip's target (…/Python3/Win64/Lib/site-packages) is ALREADY on sys.path inside the
+# editor, so a freshly installed PySide6 imports in-process — no UEFN restart. The old
+# bootstrap demanded one only because it raised SystemExit instead of retrying the import.
+_PIP_DEPS = ("PySide6",)
+
+
+def _pip_stream(args, on_line):
+    """Run the UE interpreter, feeding each output line to on_line. Returns the exit code.
+
+    CREATE_NO_WINDOW keeps pip's console from flashing up in the user's face — the
+    whole point of the installer window. Output is merged and read line-by-line so
+    the log stays live rather than arriving in one lump at the end.
+    """
+    import subprocess
+
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    startupinfo = None
+    if hasattr(subprocess, "STARTUPINFO"):          # Windows: belt and braces
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0                 # SW_HIDE
+
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        creationflags=no_window, startupinfo=startupinfo,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    for line in proc.stdout:
+        on_line(line.rstrip())
+    proc.stdout.close()
+    return proc.wait()
+
+
+def _dark_titlebar(win):
+    """Paint the window's title bar dark (Windows 10 1809+).
+
+    Tk styles the CLIENT area only — the title bar stays light unless DWM is told
+    otherwise, which is the one thing that makes an otherwise-dark dialog look
+    broken. Attribute 20 is the documented DWMWA_USE_IMMERSIVE_DARK_MODE; early
+    1809 builds used 19, so try 20 and fall back. Purely cosmetic: any failure
+    (non-Windows, older build) leaves a light title bar and is ignored.
+    """
+    try:
+        import ctypes
+        win.update_idletasks()          # the HWND does not exist until realized
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        flag = ctypes.c_int(1)
+        for attr in (20, 19):
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr, ctypes.byref(flag), ctypes.sizeof(flag)) == 0:
+                return
+    except Exception:
+        pass
+
+
+def _center(win):
+    """Center on the screen the CURSOR is on, so it lands on the monitor in use."""
+    win.update_idletasks()
+    w, h = win.winfo_width(), win.winfo_height()
+    x = (win.winfo_screenwidth() - w) // 2
+    y = (win.winfo_screenheight() - h) // 3     # a third down reads better than dead-center
+    win.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
+
+
+def _install_deps_with_ui():
+    """Install missing deps behind a Tk progress window. True if everything is ready.
+
+    Tk is stdlib, so this runs BEFORE any third-party import — which is exactly why
+    the installer can't be written in the Qt the tool itself uses.
+    """
+    import queue
+    import threading
+    import tkinter as tk
+    from tkinter import ttk
+
     python = _find_ue_python()
     if python is None:
-        unreal.log_error("[VerseBinder] Cannot find UE python.exe")
         raise SystemExit("[VerseBinder] Cannot find UE python.exe")
 
+    # NEVER tk.Tk() inside the editor — a second root crashes it. Reuse the shared
+    # root if one exists (the MCP listener owns one); only create a root if there is
+    # none, and then own it so it can be torn down cleanly.
+    existing = getattr(tk, "_default_root", None)
+    owns_root = existing is None
+    root = tk.Tk() if owns_root else existing
+    win = tk.Toplevel(root)
+    if owns_root:
+        root.withdraw()
+
+    BG, CARD, FG, DIM, ACC = "#1e1f22", "#141517", "#e8e8ea", "#8b8d92", "#4aa3ff"
+    ERR, TRACK, EDGE = "#ff6b6b", "#2b2d31", "#34363b"
+
+    win.title("Verse Field Tool — Setup")
+    win.configure(bg=BG)
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+
+    _dark_titlebar(win)
+
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True, padx=24, pady=(20, 18))
+
+    tk.Label(body, text="Preparing the tool", bg=BG, fg=FG,
+             font=("Segoe UI", 14, "bold")).pack(anchor="w")
+    tk.Label(body, text="Installing the packages the tool needs. This runs once.",
+             bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+
+    # ttk's stock progressbar renders LIGHT on Windows (the 'vista' theme ignores
+    # background colours), so it must be re-themed with 'clam' to look dark.
+    style = ttk.Style(win)
     try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure("VB.Horizontal.TProgressbar", troughcolor=TRACK,
+                    background=ACC, bordercolor=TRACK,
+                    lightcolor=ACC, darkcolor=ACC, thickness=6)
+
+    bar = ttk.Progressbar(body, mode="indeterminate", length=440,
+                          style="VB.Horizontal.TProgressbar")
+    bar.pack(fill="x", pady=(16, 8))
+    bar.start(12)
+
+    status = tk.Label(body, text="Starting…", bg=BG, fg=DIM,
+                      font=("Segoe UI", 9), anchor="w", justify="left",
+                      wraplength=440)
+    status.pack(anchor="w", fill="x")
+
+    # The console log: collapsed by default, one click to reveal. On failure we open
+    # it automatically — that's the moment the user actually needs pip's real output.
+    log_open = tk.BooleanVar(value=False)
+
+    disclose = tk.Label(body, text="▸  Console log", bg=BG, fg=ACC,
+                        font=("Segoe UI", 9), cursor="hand2")
+    disclose.pack(anchor="w", pady=(14, 0))
+
+    log_box = tk.Frame(body, bg=EDGE, padx=1, pady=1)   # 1px border via the parent bg
+    log_text = tk.Text(log_box, height=11, width=62, bg=CARD, fg="#b9bbc0",
+                       insertbackground=FG, relief="flat", wrap="none",
+                       font=("Consolas", 8), padx=10, pady=8,
+                       highlightthickness=0, borderwidth=0)
+    log_scroll = tk.Scrollbar(log_box, command=log_text.yview)
+    log_text.configure(yscrollcommand=log_scroll.set, state="disabled")
+    log_text.pack(side="left", fill="both", expand=True)
+    log_scroll.pack(side="right", fill="y")
+
+    footer = tk.Frame(body, bg=BG)
+    footer.pack(fill="x", pady=(12, 0))
+
+    def toggle_log():
+        if log_open.get():
+            log_box.pack_forget()
+            log_open.set(False)
+            disclose.configure(text="▸  Console log")
+        else:
+            # Keep the log ABOVE the footer no matter when it is revealed.
+            log_box.pack(fill="both", expand=True, pady=(8, 0), before=footer)
+            log_open.set(True)
+            disclose.configure(text="▾  Console log")
+        _center(win)
+
+    disclose.bind("<Button-1>", lambda _e: toggle_log())
+
+    # The worker thread must not touch Tk (it isn't thread-safe): it posts messages
+    # onto a queue that the UI thread drains on a timer.
+    events = queue.Queue()
+    state = {"ok": False, "done": False}
+
+    def work():
         try:
-            subprocess.check_call([python, "-m", "ensurepip"])
-        except Exception:
+            events.put(("status", "Checking pip…"))
+            try:
+                _pip_stream([python, "-m", "ensurepip"],
+                            lambda ln: events.put(("log", ln)))
+            except Exception as exc:               # ensurepip is best-effort
+                events.put(("log", "ensurepip: %s" % exc))
+
+            for dep in _PIP_DEPS:
+                events.put(("status", "Downloading %s…" % dep))
+                code = _pip_stream(
+                    [python, "-m", "pip", "install", "--upgrade", dep],
+                    lambda ln: events.put(("log", ln)))
+                if code != 0:
+                    events.put(("fail", "pip exited with code %d while installing %s."
+                                % (code, dep)))
+                    return
+
+            events.put(("status", "Loading…"))
+            _clear_pyside_cache()
+            if not _pyside_importable():
+                events.put(("fail", "PySide6 installed but will not import."))
+                return
+            events.put(("ok", None))
+        except Exception as exc:
+            events.put(("fail", str(exc)))
+
+    def append(line):
+        log_text.configure(state="normal")
+        log_text.insert("end", line + "\n")
+        log_text.see("end")
+        log_text.configure(state="disabled")
+
+    def finish_ok():
+        state["ok"] = state["done"] = True
+        win.destroy()
+
+    def button(parent, text, command, accent=False):
+        b = tk.Button(parent, text=text, command=command,
+                      bg=(ACC if accent else TRACK), fg=("#0b1520" if accent else FG),
+                      activebackground=("#63b0ff" if accent else EDGE),
+                      activeforeground=("#0b1520" if accent else FG),
+                      relief="flat", borderwidth=0, padx=16, pady=5,
+                      cursor="hand2", font=("Segoe UI", 9))
+        b.bind("<Enter>", lambda _e: b.configure(
+            bg=("#63b0ff" if accent else EDGE)))
+        b.bind("<Leave>", lambda _e: b.configure(bg=(ACC if accent else TRACK)))
+        return b
+
+    def finish_fail(msg):
+        state["ok"], state["done"] = False, True
+        bar.stop()
+        bar.pack_forget()               # a dead bar just sits there looking stuck
+        status.configure(text=msg, fg=ERR)
+        if not log_open.get():          # the user needs the real output NOW
+            toggle_log()
+        button(footer, "Close", win.destroy).pack(side="right")
+        button(footer, "Retry", retry, accent=True).pack(side="right", padx=(0, 8))
+        _center(win)
+
+    def retry():
+        """Re-run the install in place — a transient network blip shouldn't cost a rerun."""
+        for child in footer.winfo_children():
+            child.destroy()
+        state["ok"], state["done"] = False, False
+        status.configure(text="Starting…", fg=DIM)
+        bar.pack(fill="x", pady=(16, 8), before=status)
+        bar.start(12)
+        append("")
+        append("=== retrying ===")
+        threading.Thread(target=work, daemon=True).start()
+        win.after(60, pump)
+
+    def pump():
+        try:
+            while True:
+                kind, payload = events.get_nowait()
+                if kind == "log":
+                    append(payload)
+                elif kind == "status":
+                    status.configure(text=payload)
+                    append("--- %s" % payload)
+                elif kind == "ok":
+                    finish_ok()
+                    return
+                elif kind == "fail":
+                    finish_fail(payload)
+                    return
+        except queue.Empty:
             pass
-        subprocess.check_call([python, "-m", "pip", "install", "PySide6"])
+        win.after(60, pump)
+
+    _center(win)
+    threading.Thread(target=work, daemon=True).start()
+    win.after(60, pump)
+
+    # Closing the window mid-install is a cancel, not a success.
+    win.protocol("WM_DELETE_WINDOW", lambda: (state.update(done=True), win.destroy()))
+    win.wait_window()          # modal: block here until the install resolves
+    if owns_root:
+        root.destroy()
+    return state["ok"]
+
+
+def _ensure_deps():
+    """True when the tool can run. Installs (with UI) if it must."""
+    import unreal
+
+    if _pyside_importable():
+        return True
+
+    _clear_pyside_cache()
+    unreal.log_warning("[VerseBinder] PySide6 missing — installing…")
+    try:
+        ok = _install_deps_with_ui()
     except Exception as exc:
         unreal.log_error("[VerseBinder] Install failed: %s" % exc)
-        raise SystemExit("[VerseBinder] Install failed: %s" % exc)
-
-    unreal.log("[VerseBinder] PySide6 installed — RESTART UEFN, then run again.")
-    raise SystemExit("[VerseBinder] Restart UEFN to finish setup.")
-
-
-_needs_restart = False
-try:
-    _ensure_deps()
-except SystemExit:
-    _needs_restart = True
+        return False
+    if ok:
+        unreal.log("[VerseBinder] Dependencies ready.")
+    else:
+        unreal.log_error("[VerseBinder] Setup did not complete.")
+    return ok
 
 
-if not _needs_restart:
+_ready = _ensure_deps()
+
+
+if _ready:
     import ctypes
     import functools
     import os

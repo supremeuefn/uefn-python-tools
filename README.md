@@ -8,7 +8,12 @@ A growing collection of Python tools for UEFN. More will be added over time.
 and MVVM-binding **Verse-exposed variables ("Verse fields")** on UEFN Widget Blueprints.
 
 It's fully self-contained: it only needs `unreal`, the Python standard library, and
-PySide6. Run it inside UEFN via `execute_python`.
+PySide6. Run it inside UEFN via `Tools > Execute Python Script…`.
+
+**First run** installs PySide6 for you. A small progress window appears while it
+downloads (no console window, and a collapsible *Console log* if you want to watch pip),
+then the tool opens straight away — no UEFN restart and no need to run the script twice.
+If the install fails, the log expands automatically and a **Retry** button appears.
 
 ### What it does
 
