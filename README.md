@@ -15,6 +15,12 @@ downloads (no console window, and a collapsible *Console log* if you want to wat
 then the tool opens straight away — no UEFN restart and no need to run the script twice.
 If the install fails, the log expands automatically and a **Retry** button appears.
 
+**Auto-update.** On launch the tool checks GitHub for a newer version (a tiny, fast
+check with a short timeout). If one exists it downloads and applies it on the spot, then
+opens the updated tool — no manual re-download. When you're already up to date or offline,
+the check is skipped instantly and the tool opens as normal. The current version and a
+link to the repo show in the tool's footer. Version starts at **v1.0**.
+
 ### What it does
 
 - **Bind** — bulk-bind a widget's Verse fields to engine widget properties (Text,

@@ -5,6 +5,10 @@ PySide6 — auto-installed on first run behind a Tk progress window, then the to
 opens straight away (no console, no UEFN restart). Run inside UEFN:
     Tools > Execute Python Script...  ->  verse_field_tool.py
 
+Self-updating: on launch it checks a tiny VERSION file on GitHub (short timeout,
+skipped silently when offline). A newer release is downloaded over this file and
+re-run in-process, so the update lands on the same run. Current version below.
+
 Binds Verse fields to ENGINE PROPERTIES (Text, ColorAndOpacity, ...), to
 SUB-WIDGET FIELDS on embedded child widgets (same type only), or to button
 EVENTS — one at a time, zipped in pairs, or in bulk by `#`-numbered patterns.
@@ -25,6 +29,21 @@ HARD-WON DETAILS (each cost a crash or a corrupt asset)
 """
 
 import sys
+
+__version__ = "1.0"
+
+# Auto-update source. The tool checks a tiny VERSION file on GitHub raw (a few
+# bytes) on launch; only if it names a newer version does it pull the full file.
+_REPO_URL = "https://github.com/supremeuefn/uefn-python-tools"
+_RAW_BASE = "https://raw.githubusercontent.com/supremeuefn/uefn-python-tools/main"
+_VERSION_URL = _RAW_BASE + "/VERSION.txt"
+_TOOL_URL = _RAW_BASE + "/tools/verse_field_tool.py"
+_AUTHOR = "SupremeUEFN"
+_AUTHOR_URL = "https://x.com/SupremeUEFN"
+
+# Set on the reloaded child so the freshly-exec'd copy does not check-and-reload
+# again — otherwise a successful update would recurse forever.
+_RELOAD_FLAG = "VERSE_BINDER_UPDATED"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -333,6 +352,166 @@ def _install_deps_with_ui():
     return state["ok"]
 
 
+def _http_get(url, timeout):
+    """Fetch a URL, returning bytes — or None on ANY failure (offline, 404, slow).
+
+    A cache-buster defeats GitHub raw's CDN caching so the check sees new
+    releases promptly. urllib is stdlib, so this needs no third-party import.
+    """
+    import urllib.request
+    sep = "&" if "?" in url else "?"
+    req = urllib.request.Request(
+        url + sep + "cb=" + __version__,
+        headers={"User-Agent": "VerseBinder/" + __version__,
+                 "Cache-Control": "no-cache"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception:
+        return None
+
+
+def _version_tuple(s):
+    """'1.10' -> (1, 10) for correct numeric ordering (so 1.10 > 1.9)."""
+    parts = []
+    for chunk in str(s).strip().split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _check_for_update():
+    """Return the newer version string if one is available, else None.
+
+    Fast path: one tiny VERSION.txt fetch with a short timeout. Any network
+    problem returns None so the tool opens immediately — an update is a bonus,
+    never a gate. Skipped entirely in a reloaded child (see _RELOAD_FLAG).
+    """
+    import os
+    if os.environ.get(_RELOAD_FLAG):
+        return None
+    raw = _http_get(_VERSION_URL, timeout=3)
+    if raw is None:
+        return None
+    remote = raw.decode("utf-8", "replace").strip().splitlines()[0].strip()
+    if not remote:
+        return None
+    try:
+        newer = _version_tuple(remote) > _version_tuple(__version__)
+    except Exception:
+        return None
+    return remote if newer else None
+
+
+def _apply_update_with_ui(new_version):
+    """Download the new tool over this file behind a Tk window, then reload it.
+
+    Returns True and NEVER returns to the caller normally on success: it re-execs
+    the freshly downloaded code in-process (with _RELOAD_FLAG set so the child
+    skips its own update check) and raises SystemExit. On any failure it returns
+    False and the caller proceeds to open the current version.
+    """
+    import os
+    import tkinter as tk
+    from tkinter import ttk
+
+    existing = getattr(tk, "_default_root", None)
+    owns_root = existing is None
+    root = tk.Tk() if owns_root else existing
+    win = tk.Toplevel(root)
+    if owns_root:
+        root.withdraw()
+
+    BG, FG, DIM, ACC = "#1e1f22", "#e8e8ea", "#8b8d92", "#4aa3ff"
+
+    win.title("Verse Field Tool — Update")
+    win.configure(bg=BG)
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+    _dark_titlebar(win)
+
+    body = tk.Frame(win, bg=BG)
+    body.pack(fill="both", expand=True, padx=24, pady=(20, 20))
+    tk.Label(body, text="Updating the tool", bg=BG, fg=FG,
+             font=("Segoe UI", 14, "bold")).pack(anchor="w")
+    tk.Label(body, text="A new version (v%s) is available. Downloading…" % new_version,
+             bg=BG, fg=DIM, font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+
+    style = ttk.Style(win)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure("VBU.Horizontal.TProgressbar", troughcolor="#2b2d31",
+                    background=ACC, bordercolor="#2b2d31",
+                    lightcolor=ACC, darkcolor=ACC, thickness=6)
+    bar = ttk.Progressbar(body, mode="indeterminate", length=380,
+                          style="VBU.Horizontal.TProgressbar")
+    bar.pack(fill="x", pady=(16, 0))
+    bar.start(12)
+
+    _center(win)
+    win.update()
+
+    # The download is quick and one-shot, so a blocking fetch on the UI thread is
+    # fine here — the window is already painted, and there is nothing to interact
+    # with until it finishes. (The installer streams pip because THAT is slow.)
+    payload = _http_get(_TOOL_URL, timeout=20)
+    path = os.path.abspath(__file__)
+    code = None
+
+    # Validate BEFORE touching the file: a truncated or corrupt download must never
+    # overwrite a working tool. Only a payload that both looks like the tool and
+    # actually compiles is allowed to replace it.
+    if payload and b"__version__" in payload:
+        try:
+            code = compile(payload.decode("utf-8", "replace"), path, "exec")
+            with open(path + ".new", "wb") as f:    # write beside, then swap in
+                f.write(payload)
+            os.replace(path + ".new", path)         # atomic on Windows & POSIX
+        except Exception:
+            code = None
+
+    bar.stop()
+    win.destroy()
+    if owns_root:
+        root.destroy()
+
+    if code is None:
+        return False   # download/compile failed — caller opens the current version
+
+    # Re-run the freshly written file in-process so the NEW version opens THIS run.
+    # _RELOAD_FLAG stops the child from checking for updates again (no recursion).
+    # If the new code throws at import, the file is already updated, so a plain
+    # re-run next launch recovers — don't crash the editor over it.
+    os.environ[_RELOAD_FLAG] = "1"
+    try:
+        exec(code, {"__name__": "__main__", "__file__": path})
+    except SystemExit:
+        raise
+    except Exception:
+        return False
+    raise SystemExit  # the reloaded copy has taken over and already opened the UI
+
+
+def _maybe_update():
+    """Check for and apply an update. Silent and fast when up to date or offline."""
+    import unreal
+    try:
+        newer = _check_for_update()
+    except Exception:
+        return
+    if not newer:
+        return
+    unreal.log("[VerseBinder] Updating v%s -> v%s…" % (__version__, newer))
+    try:
+        _apply_update_with_ui(newer)   # raises SystemExit on success
+    except SystemExit:
+        raise
+    except Exception as exc:
+        unreal.log_warning("[VerseBinder] Update skipped: %s" % exc)
+
+
 def _ensure_deps():
     """True when the tool can run. Installs (with UI) if it must."""
     import unreal
@@ -355,6 +534,11 @@ def _ensure_deps():
 
 
 _ready = _ensure_deps()
+
+# Check for a newer release once deps are present. On success this re-execs the
+# updated file and never returns here; when up to date or offline it's a fast no-op.
+if _ready:
+    _maybe_update()
 
 
 if _ready:
@@ -3685,6 +3869,33 @@ if _ready:
             self.tabs.addTab(self._build_bind_tab(), "Bind")
             self.tabs.addTab(self._build_create_tab(), "Create Fields")
             self.tabs.addTab(self._build_manage_tab(), "Manage Fields")
+
+            outer.addLayout(self._build_footer())
+
+        def _build_footer(self):
+            """Credit + repo link on the left, version on the right."""
+            footer = QHBoxLayout()
+            footer.setContentsMargins(4, 0, 4, 0)
+
+            # QLabel rich text gives real clickable hyperlinks; openExternalLinks
+            # hands the URL to the OS browser (no handler wiring needed).
+            credit = QLabel(
+                'Created by <a href="%s" style="color:%s;text-decoration:none;">%s</a>'
+                '&nbsp;·&nbsp;'
+                '<a href="%s" style="color:%s;text-decoration:none;">Repository</a>'
+                % (_AUTHOR_URL, C_ACC, _AUTHOR, _REPO_URL, C_ACC))
+            credit.setOpenExternalLinks(True)
+            credit.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
+            credit.setStyleSheet("color:%s; font-size:11px;" % C_TX2)
+
+            version = QLabel("v%s" % __version__)
+            version.setStyleSheet("color:%s; font-size:11px;" % C_TX2)
+            version.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            footer.addWidget(credit)
+            footer.addStretch(1)
+            footer.addWidget(version)
+            return footer
 
         def _build_bind_tab(self):
             tab = QWidget()
