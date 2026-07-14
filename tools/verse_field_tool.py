@@ -2407,14 +2407,12 @@ if not _needs_restart:
 
     def _apply_param_value(pkg, event_name, field, value, params):
         """Reconcile the clone's inherited pin with its FIELD (build one, or strip
-        it), then write "Param 0". Returns True if the pin had to be BUILT.
+        it), then write "Param 0".
 
         The value is always written, even when the caller gave none: the inherited
-        one belongs to a different button.
-
-        A value in a CLONED pin survives the create's compile; one in a pin we
-        SYNTHESIZED does not (the compiler regenerates it from the field). Only
-        the caller can fix that, with a second pass -- hence the return value.
+        one belongs to a different button. It will NOT survive the create's compile
+        (which regenerates every pin from the field) -- the caller's second pass is
+        what makes it stick. Writing it here anyway keeps the on-disk state honest.
         """
         param = params.get(field)
         export = next(e for e in pkg.exports if e["name"] == event_name)
@@ -2483,6 +2481,25 @@ if not _needs_restart:
                     else _seed_first_event(wbp_path))
             return seed, declaring, params
 
+        def resolve_delegate(widget, delegate, declaring):
+            """Translate an INHERITED delegate to the one `widget` really declares.
+
+            With no delegate given, a clone keeps the donor's -- but the two button
+            shapes spell the same event differently (OnButtonBaseClicked vs
+            OnButtonClicked), so a UEFN-button donor hands a Custom Button a name it
+            does not have, and the compile fails with "the property path
+            '<widget>.OnButtonBaseClicked' is invalid". Map it through the group it
+            belongs to and pick the name this widget actually declares.
+            """
+            if (widget, delegate) in declaring:
+                return delegate
+            for _label, candidates in _EVENT_DELEGATES:
+                if delegate in candidates:
+                    for candidate in candidates:
+                        if (widget, candidate) in declaring:
+                            return candidate
+            return delegate      # unknown group: leave it, prepare() already vetted
+
         def patch(pkg, prepared):
             seed, declaring, params = prepared
             pending = list(additions)
@@ -2496,12 +2513,14 @@ if not _needs_restart:
                 # and deleting it: no export is ever removed (shrinking the export
                 # table is a whole class of surgery avoided).
                 widget, field, delegate, value = _event_addition(pending.pop(0))
+                target = delegate or resolve_delegate(
+                    widget, _SEED_DELEGATE, declaring)
                 _retarget_event_in_package(
-                    pkg, seed, widget, field, delegate or _SEED_DELEGATE,
-                    declaring.get((widget, delegate or _SEED_DELEGATE)))
-                built = _apply_param_value(pkg, seed, field, value, params)
+                    pkg, seed, widget, field, target,
+                    declaring.get((widget, target)))
+                _apply_param_value(pkg, seed, field, value, params)
                 result["created"].append((seed, widget, field))
-                if built:
+                if params.get(field):
                     result["_values"].append(
                         (seed, value if value is not None
                          else _EVENT_PARAM_DEFAULTS[params[field]]))
@@ -2517,15 +2536,18 @@ if not _needs_restart:
                 if template is None:
                     raise RuntimeError("could not establish an event to clone")
 
-                # Declaring class is per (widget, delegate); with no delegate
-                # given the clone keeps the template's, so resolve against it.
+                # With no delegate given the clone keeps the donor's, which may be
+                # the WRONG SPELLING for this button shape -- resolve it against
+                # what this widget actually declares. Declaring class is per
+                # (widget, delegate), so resolve that from the settled name.
+                target = delegate or resolve_delegate(
+                    widget, template_delegate, declaring)
                 name = _clone_event_in_package(
-                    pkg, template, widget, field, delegate,
-                    declaring_class=declaring.get(
-                        (widget, delegate or template_delegate)))
-                built = _apply_param_value(pkg, name, field, value, params)
+                    pkg, template, widget, field, target,
+                    declaring_class=declaring.get((widget, target)))
+                _apply_param_value(pkg, name, field, value, params)
                 result["created"].append((name, widget, field))
-                if built:
+                if params.get(field):
                     result["_values"].append(
                         (name, value if value is not None
                          else _EVENT_PARAM_DEFAULTS[params[field]]))
@@ -2533,10 +2555,10 @@ if not _needs_restart:
 
         result["backup"] = _patch_on_disk(wbp_path, patch, prepare=prepare)
 
-        # SECOND PASS -- only for values in pins we SYNTHESIZED, whose compile
-        # would otherwise revert them. A cloned pin's value already stuck, and an
-        # editor cycle costs ~2s and closes the tab, so it is skipped when it can
-        # be (the common case: a donor binding exists).
+        # SECOND PASS -- the create's compile REGENERATES every pin's value from
+        # the field, so a value written above (cloned or synthesized alike) reverts
+        # to the default. Rewriting it after that compile is the only way it sticks.
+        # Skipped entirely when no binding carries a value.
         valued = result.pop("_values")
         if valued:
             def set_values(pkg, _prepared):

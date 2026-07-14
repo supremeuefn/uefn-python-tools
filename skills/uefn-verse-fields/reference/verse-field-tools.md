@@ -531,16 +531,19 @@ built onto a plain event that never had one.
 
 Both write correctly to disk and are then reverted by the reload. Neither errors.
 
-**1. A SYNTHESIZED pin's value is regenerated on compile — a cloned one's is not.** Build a pin
-with `_add_pin` and write its value in the same `_patch_on_disk` pass, and the reload flattens it
-back to the default (measured: patcher wrote `'5'`, asset came back `'0'`). A value written into a
-pin the clone *inherited* survives that same compile untouched. So only a synthesized pin needs a
-**second pass** — create the events, let that compile, then set those values in their own patch.
+**1. The create's compile regenerates EVERY pin's value from the field.** Write a value in the
+same `_patch_on_disk` pass that creates the event — cloned pin or synthesized, it makes no
+difference — and the reload flattens it back to the default (measured: patcher wrote `1..7`, all
+seven came back `'0'`). Values only stick if they are written in a **second pass**, after the
+create's compile has already run.
 
-That distinction is worth honouring rather than always paying for two passes: an editor cycle
-(unload → reload → compile → save) costs **~2s and closes the user's widget tab**. Gating the
-second pass on "did we actually build a pin" takes the common case (a donor exists) from 2 passes
-to 1 — measured **4.55s → 2.82s** for a 4-button bind, and the tab closes once instead of twice.
+> ⚠️ **A wrong measurement here shipped a bug.** An earlier pass concluded that a *cloned* pin's
+> value survives the compile and only a *synthesized* one needs the second pass — so the second
+> pass was gated on "did we build a pin", which took a 4-button bind from 4.55s to 2.82s. It was
+> wrong. Cloned values are regenerated too. The symptom was maximally deceptive: in a real bind
+> exactly ONE binding synthesizes its pin (the rest clone from it), so exactly one button kept its
+> number and every other one silently read `0`. **Do not re-derive this "optimization".** The
+> second pass is unconditional for any binding carrying a value; that is what it costs.
 
 **2. A clone's GRAPH is typed, and the engine trusts it over the patched FName.** Clone an
 `int` binding onto a `float` field and the asset comes back with the field silently re-pointed
@@ -548,6 +551,20 @@ to the int one — the binding is wrong, and nothing complains. So the donor's p
 **match** the field's. A parameterless event is always a safe donor (its graph carries no
 parameter), which is why `_pick_template` prefers a same-typed binding, else a plain one, and
 lets `_add_pin` build the missing pin.
+
+**3. A clone with no delegate inherits the DONOR's — which may be the wrong spelling.** The two
+button shapes name the same event differently (`OnButtonBaseClicked` on a UEFN button,
+`OnButtonClicked` on a Custom Button). Omit the delegate and a UEFN-button donor hands its name
+to a Custom Button that does not declare it; the compile then fails, loudly this time:
+
+```
+Event 'Custom Button.On Clicked -> Self.VF_Click()': the property path
+'UIFrameworkCustomButtonWidget_297.OnButtonBaseClicked' is invalid.
+```
+
+`prepare()`'s guard does not catch it — that only vets a delegate the caller *passed*. Resolve the
+inherited name through the `_EVENT_DELEGATES` group against what the target widget really declares
+(`resolve_delegate`). The GUI always sends an explicit delegate, so this only bites API callers.
 
 #### Changing the value's LENGTH resizes four fields, not one
 
