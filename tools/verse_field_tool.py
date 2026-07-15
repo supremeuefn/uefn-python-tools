@@ -529,6 +529,38 @@ def _md_to_html(md):
     return "".join(out)
 
 
+def _self_path():
+    """Absolute path to THIS tool file on disk, robustly.
+
+    UEFN's "Execute Python Script" does NOT set __file__ in the script's globals,
+    nor put the script's folder on sys.path, and the tool can live anywhere outside
+    the project — so __file__, sys.modules and sys.path all fail to locate it.
+
+    What ALWAYS works: this function's own code object carries `co_filename`, the
+    path that was passed to compile() when the script loaded, which UEFN sets
+    correctly. That's the reliable source; the rest are only fallbacks.
+    """
+    import os
+    # Primary: the path compile() recorded on this very function.
+    try:
+        cf = _self_path.__code__.co_filename
+        if cf and os.path.isfile(cf):
+            return os.path.abspath(cf)
+    except Exception:
+        pass
+    # Fallback: __file__ if the loader happened to set it.
+    p = globals().get("__file__")
+    if p and os.path.isfile(p):
+        return os.path.abspath(p)
+    # Fallback: a loaded module whose file basename matches this tool.
+    base = "verse_field_tool.py"
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if f and os.path.basename(f) == base and os.path.isfile(f):
+            return os.path.abspath(f)
+    raise RuntimeError("cannot locate %s on disk" % base)
+
+
 def _download_and_swap():
     """Download the new tool over this file, returning the compiled code or None.
 
@@ -539,37 +571,42 @@ def _download_and_swap():
     """
     import os
     payload = _http_get(_TOOL_URL, timeout=20)
-    path = os.path.abspath(__file__)
-    if payload and b"__version__" in payload:
-        try:
-            code = compile(payload.decode("utf-8", "replace"), path, "exec")
-            with open(path + ".new", "wb") as f:    # write beside, then swap in
-                f.write(payload)
-            os.replace(path + ".new", path)         # atomic on Windows & POSIX
-            return code
-        except Exception:
-            return None
-    return None
+    if not (payload and b"__version__" in payload):
+        return None
+    try:
+        path = _self_path()
+        code = compile(payload.decode("utf-8", "replace"), path, "exec")
+        with open(path + ".new", "wb") as f:        # write beside, then swap in
+            f.write(payload)
+        os.replace(path + ".new", path)             # atomic on Windows & POSIX
+        return code
+    except Exception:
+        return None
 
 
 def _reexec_updated(code):
-    """Re-run the freshly written file in-process; raise SystemExit on success.
+    """Re-run the freshly written file in-process; return True on success.
 
-    _RELOAD_FLAG stops the child from checking for updates again (no recursion).
-    If the new code throws at import, the file is already updated on disk, so a
-    plain re-run next launch recovers — don't crash the editor over it. Returns
-    False only if the child failed to take over.
+    Runs the new file's main() which builds a fresh window. Deliberately does NOT
+    raise SystemExit — throwing an exception up through Qt's C++ event loop (this
+    is called from a timer/callback) is what froze the editor. Returning normally
+    lets the caller's stack unwind cleanly.
+
+    _RELOAD_FLAG stops the freshly-run copy from checking for updates again (no
+    recursion). If the new code throws at import, the file is already updated on
+    disk, so a plain re-run next launch recovers — don't crash the editor over it.
     """
     import os
     os.environ[_RELOAD_FLAG] = "1"
-    path = os.path.abspath(__file__)
+    try:
+        path = _self_path()
+    except Exception:
+        path = None
     try:
         exec(code, {"__name__": "__main__", "__file__": path})
-    except SystemExit:
-        raise
+        return True
     except Exception:
         return False
-    raise SystemExit  # the reloaded copy has taken over and already opened the UI
 
 
 def _apply_update_with_ui(new_version):
@@ -634,7 +671,13 @@ def _apply_update_with_ui(new_version):
 
     if code is None:
         return False   # download/compile failed — caller opens the current version
-    return _reexec_updated(code)
+    # Launch-time path: this runs at IMPORT time, before any Qt event loop exists,
+    # so raising SystemExit after the reload is safe here (it just stops this old
+    # import from continuing on to build a second window). That is NOT true of the
+    # in-app manual path, which runs inside the Qt loop — see _install_update_now.
+    if _reexec_updated(code):
+        raise SystemExit
+    return False
 
 
 def _maybe_update():
@@ -4331,11 +4374,23 @@ if _ready:
 
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
-            self._install_update_now(new_version)
+            # IMPORTANT: run the install AFTER exec() returns, on a clean event-loop
+            # tick — never inside the modal loop. The install re-execs the file
+            # in-process (which builds a new window and raises SystemExit); doing
+            # that while still nested inside dlg.exec() re-enters Qt's event loop and
+            # hangs. Deferring to the top level avoids the nesting entirely.
+            QTimer.singleShot(0, lambda: self._install_update_now(new_version))
 
         def _install_update_now(self, new_version):
-            """Download + swap + reload, with a small modal 'installing' notice.
-            Reached only after the user reviewed the notes and clicked Install."""
+            """Download + swap the file, then reload the tool automatically.
+
+            Reliability is the whole game here: re-execing the new file inside a Qt
+            callback (or raising SystemExit through Qt's C++ event loop) froze the
+            editor. So this splits into two clean stages on SEPARATE event-loop
+            ticks: (1) download + swap + tear the old window down, then (2) on a
+            fresh top-level tick with nothing nested above it, exec the new file
+            (which builds the new window). _reexec_updated no longer raises.
+            """
             busy = QDialog(self)
             busy.setWindowTitle("Updating")
             bl = QVBoxLayout(busy)
@@ -4343,22 +4398,39 @@ if _ready:
             msg = QLabel("Downloading v%s and reloading the tool…" % new_version)
             msg.setStyleSheet("color:%s; font-size:12px;" % C_TX0)
             bl.addWidget(msg)
-            busy.setModal(True)
-            busy.show()
+            busy.show()               # non-modal: no nested exec() loop to trap us
             QApplication.processEvents()
 
-            code = _download_and_swap()
+            try:
+                code = _download_and_swap()
+            except Exception:
+                code = None
+
+            busy.close()
+
             if code is None:
-                busy.close()
                 QMessageBox.warning(
                     self, "Update failed",
                     "Couldn't download or verify the update. Your current version "
                     "is untouched — try again later, or grab the latest file from "
                     "the repository.")
                 return
-            # Re-exec the new file in-process. On success this raises SystemExit and
-            # the reloaded copy opens its own window; the current one is torn down.
-            _reexec_updated(code)
+
+            # Tear down THIS window and its app anchor NOW, so main()'s "reuse
+            # existing window" branch sees none alive and builds a fresh one.
+            app = QApplication.instance()
+            if hasattr(app, "_verse_binder_win"):
+                try:
+                    del app._verse_binder_win
+                except Exception:
+                    pass
+            self.close()
+            self.deleteLater()
+
+            # Stage 2 on a FRESH tick: by the time this fires, this handler has fully
+            # returned and the old window is gone, so exec()'ing the new file runs at
+            # the top level — no dialog/callback nesting, no SystemExit through Qt.
+            QTimer.singleShot(50, lambda: _reexec_updated(code))
 
         def _build_bind_tab(self):
             tab = QWidget()
