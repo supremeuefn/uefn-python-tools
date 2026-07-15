@@ -30,7 +30,7 @@ HARD-WON DETAILS (each cost a crash or a corrupt asset)
 
 import sys
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 # Auto-update source. The tool checks a tiny VERSION file on GitHub raw (a few
 # bytes) on launch; only if it names a newer version does it pull the full file.
@@ -38,12 +38,55 @@ _REPO_URL = "https://github.com/supremeuefn/uefn-python-tools"
 _RAW_BASE = "https://raw.githubusercontent.com/supremeuefn/uefn-python-tools/main"
 _VERSION_URL = _RAW_BASE + "/VERSION.txt"
 _TOOL_URL = _RAW_BASE + "/tools/verse_field_tool.py"
+_CHANGELOG_URL = _RAW_BASE + "/CHANGELOG.md"
 _AUTHOR = "SupremeUEFN"
 _AUTHOR_URL = "https://x.com/SupremeUEFN"
 
 # Set on the reloaded child so the freshly-exec'd copy does not check-and-reload
 # again — otherwise a successful update would recurse forever.
 _RELOAD_FLAG = "VERSE_BINDER_UPDATED"
+
+# Auto-update is OFF by default. Downloading and executing code from the internet
+# on every launch is a supply-chain risk (a hijacked repo or a bad merge would run
+# on every machine), so the user must opt in via Settings. Even when it IS on, the
+# tool shows what the release changes and asks before installing.
+_SETTINGS_FILE = "verse_binder_settings.json"
+_DEFAULT_SETTINGS = {"auto_update": False}
+
+
+def _settings_path():
+    import os
+    import unreal
+    return os.path.join(unreal.Paths.project_saved_dir(), _SETTINGS_FILE)
+
+
+def _load_settings():
+    """Read the on-disk settings, falling back to defaults on any problem.
+
+    Kept in the project's Saved/ dir so it survives the user replacing the single
+    tool file (the only file they keep) — the preference outlives the script.
+    """
+    import json
+    out = dict(_DEFAULT_SETTINGS)
+    try:
+        with open(_settings_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            out.update({k: data[k] for k in _DEFAULT_SETTINGS if k in data})
+    except Exception:
+        pass
+    return out
+
+
+def _save_settings(settings):
+    """Persist settings; never raise (a failed write must not break the tool)."""
+    import json
+    try:
+        with open(_settings_path(), "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -403,15 +446,135 @@ def _check_for_update():
     return remote if newer else None
 
 
+def _fetch_changelog():
+    """Return the repo's CHANGELOG.md text (so the user can see what an update
+    pulls in before installing), or None if it can't be fetched. Best-effort:
+    the update never depends on it."""
+    raw = _http_get(_CHANGELOG_URL, timeout=5)
+    if not raw:
+        return None
+    text = raw.decode("utf-8", "replace").strip()
+    return text or None
+
+
+def _incoming_releases(text, current):
+    """Parse the changelog into the releases NEWER than `current`, newest first.
+
+    Returns a list of (version_string, body_markdown). A user on v1.1 updating to
+    v1.5 should see EVERY release in between (1.2…1.5), each as its own section so
+    they can read the notes and review that release's commits individually. The
+    file's intro (anything before the first `## vX.Y`) is dropped.
+    """
+    import re
+    if not text:
+        return []
+    cur = _version_tuple(current)
+    parts = re.split(r"(?m)^##\s+v([\d.]+).*$", text)
+    # parts = [intro, ver1, body1, ver2, body2, ...]
+    releases = []
+    for i in range(1, len(parts), 2):
+        ver = parts[i].strip()
+        body = (parts[i + 1] if i + 1 < len(parts) else "").strip()
+        if _version_tuple(ver) > cur:
+            releases.append((ver, body))
+    # Sort newest-first regardless of the file's own ordering.
+    releases.sort(key=lambda r: _version_tuple(r[0]), reverse=True)
+    return releases
+
+
+def _md_to_html(md):
+    """Render the small subset of Markdown our changelog uses as HTML for a QLabel:
+    `- ` / `* ` bullets, **bold**, _italic_, `code`, and paragraphs. Deliberately
+    tiny — the changelog is hand-written and plain, so no full parser is needed."""
+    import re
+    import html as _html
+
+    def inline(s):
+        s = _html.escape(s)
+        s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+        s = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", s)
+        s = re.sub(r"`(.+?)`", r"<code>\1</code>", s)
+        # Bare markdown links [text](url) -> anchor (strip; commit links are buttons).
+        s = re.sub(r"\[(.+?)\]\((.+?)\)", r"\1", s)
+        return s
+
+    lines = (md or "").splitlines()
+    out, bullets = [], []
+
+    def flush():
+        if bullets:
+            out.append("<ul style='margin:2px 0 6px 0;'>"
+                       + "".join("<li style='margin:2px 0;'>%s</li>" % b for b in bullets)
+                       + "</ul>")
+            bullets.clear()
+
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped:
+            flush()
+            continue
+        m = re.match(r"[-*]\s+(.*)", stripped)
+        if m:
+            bullets.append(inline(m.group(1)))
+        else:
+            flush()
+            out.append("<div style='margin:2px 0 6px 0;'>%s</div>" % inline(stripped))
+    flush()
+    return "".join(out)
+
+
+def _download_and_swap():
+    """Download the new tool over this file, returning the compiled code or None.
+
+    Validates BEFORE touching the file: a truncated or corrupt download must never
+    overwrite a working tool, so only a payload that both looks like the tool and
+    actually compiles is allowed to replace it (written beside, then atomically
+    swapped in). Returns the compiled code object on success, None on any failure.
+    """
+    import os
+    payload = _http_get(_TOOL_URL, timeout=20)
+    path = os.path.abspath(__file__)
+    if payload and b"__version__" in payload:
+        try:
+            code = compile(payload.decode("utf-8", "replace"), path, "exec")
+            with open(path + ".new", "wb") as f:    # write beside, then swap in
+                f.write(payload)
+            os.replace(path + ".new", path)         # atomic on Windows & POSIX
+            return code
+        except Exception:
+            return None
+    return None
+
+
+def _reexec_updated(code):
+    """Re-run the freshly written file in-process; raise SystemExit on success.
+
+    _RELOAD_FLAG stops the child from checking for updates again (no recursion).
+    If the new code throws at import, the file is already updated on disk, so a
+    plain re-run next launch recovers — don't crash the editor over it. Returns
+    False only if the child failed to take over.
+    """
+    import os
+    os.environ[_RELOAD_FLAG] = "1"
+    path = os.path.abspath(__file__)
+    try:
+        exec(code, {"__name__": "__main__", "__file__": path})
+    except SystemExit:
+        raise
+    except Exception:
+        return False
+    raise SystemExit  # the reloaded copy has taken over and already opened the UI
+
+
 def _apply_update_with_ui(new_version):
     """Download the new tool over this file behind a Tk window, then reload it.
 
-    Returns True and NEVER returns to the caller normally on success: it re-execs
-    the freshly downloaded code in-process (with _RELOAD_FLAG set so the child
-    skips its own update check) and raises SystemExit. On any failure it returns
-    False and the caller proceeds to open the current version.
+    Used only by the launch-time AUTO update path (opt-in). NEVER returns to the
+    caller normally on success: it re-execs the freshly downloaded code in-process
+    and raises SystemExit. On any failure it returns False and the caller proceeds
+    to open the current version. The in-app manual "Check for updates" path reuses
+    _download_and_swap()/_reexec_updated() directly with a Qt dialog instead.
     """
-    import os
     import tkinter as tk
     from tkinter import ttk
 
@@ -456,21 +619,7 @@ def _apply_update_with_ui(new_version):
     # The download is quick and one-shot, so a blocking fetch on the UI thread is
     # fine here — the window is already painted, and there is nothing to interact
     # with until it finishes. (The installer streams pip because THAT is slow.)
-    payload = _http_get(_TOOL_URL, timeout=20)
-    path = os.path.abspath(__file__)
-    code = None
-
-    # Validate BEFORE touching the file: a truncated or corrupt download must never
-    # overwrite a working tool. Only a payload that both looks like the tool and
-    # actually compiles is allowed to replace it.
-    if payload and b"__version__" in payload:
-        try:
-            code = compile(payload.decode("utf-8", "replace"), path, "exec")
-            with open(path + ".new", "wb") as f:    # write beside, then swap in
-                f.write(payload)
-            os.replace(path + ".new", path)         # atomic on Windows & POSIX
-        except Exception:
-            code = None
+    code = _download_and_swap()
 
     bar.stop()
     win.destroy()
@@ -479,24 +628,21 @@ def _apply_update_with_ui(new_version):
 
     if code is None:
         return False   # download/compile failed — caller opens the current version
-
-    # Re-run the freshly written file in-process so the NEW version opens THIS run.
-    # _RELOAD_FLAG stops the child from checking for updates again (no recursion).
-    # If the new code throws at import, the file is already updated, so a plain
-    # re-run next launch recovers — don't crash the editor over it.
-    os.environ[_RELOAD_FLAG] = "1"
-    try:
-        exec(code, {"__name__": "__main__", "__file__": path})
-    except SystemExit:
-        raise
-    except Exception:
-        return False
-    raise SystemExit  # the reloaded copy has taken over and already opened the UI
+    return _reexec_updated(code)
 
 
 def _maybe_update():
-    """Check for and apply an update. Silent and fast when up to date or offline."""
+    """Apply an update on launch ONLY if the user opted in (auto_update=True).
+
+    Off by default — downloading and running code from the internet on every
+    launch without asking is exactly the supply-chain risk users flagged. When
+    the setting is off, the tool never touches the network on launch beyond
+    nothing at all; the user pulls updates manually from Settings instead.
+    Silent and fast when up to date or offline.
+    """
     import unreal
+    if not _load_settings().get("auto_update"):
+        return
     try:
         newer = _check_for_update()
     except Exception:
@@ -557,7 +703,7 @@ if _ready:
         QPushButton, QTableWidget, QTableWidgetItem, QLabel, QLineEdit,
         QHeaderView, QTextEdit, QSplitter, QComboBox, QAbstractItemView,
         QGroupBox, QTabWidget, QSpinBox, QMessageBox, QAbstractSpinBox,
-        QCheckBox,
+        QCheckBox, QDialog, QScrollArea, QFrame,
     )
     from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
     from PySide6.QtGui import (QColor, QPainter, QPen, QFont, QIntValidator,
@@ -3873,7 +4019,7 @@ if _ready:
             outer.addLayout(self._build_footer())
 
         def _build_footer(self):
-            """Credit + repo link on the left, version on the right."""
+            """Credit + repo link on the left, Settings + version on the right."""
             footer = QHBoxLayout()
             footer.setContentsMargins(6, 4, 6, 2)
 
@@ -3888,6 +4034,22 @@ if _ready:
             credit.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse)
             credit.setStyleSheet("color:%s; font-size:14px;" % C_TX2)
 
+            # "Update available" indicator — hidden until the silent launch check
+            # finds a newer version. Informational only: it tells the user to go to
+            # Settings, keeping a single deliberate path to installing an update.
+            # Lives just left of Settings so it's noticed without crowding the version.
+            self.update_banner = QLabel("●  A new update is available")
+            self.update_banner.setStyleSheet(
+                "color:%s; background:transparent; font-size:14px; font-weight:700;"
+                " padding:6px 8px;" % C_OK)
+            self.update_banner.setVisible(False)
+            self._pending_update = None
+
+            gear = QPushButton("⚙  Settings")
+            gear.setToolTip("Auto-update preference and manual update check")
+            gear.setStyleSheet("font-size:14px; padding:6px 16px;")
+            gear.clicked.connect(self._open_settings)
+
             version = QLabel("v%s" % __version__)
             version.setStyleSheet(
                 "color:%s; font-size:14px; font-weight:600;" % C_TX0)
@@ -3895,8 +4057,289 @@ if _ready:
 
             footer.addWidget(credit)
             footer.addStretch(1)
+            footer.addWidget(self.update_banner)
+            footer.addSpacing(6)
+            footer.addWidget(gear)
+            footer.addSpacing(10)
             footer.addWidget(version)
             return footer
+
+        def _start_background_update_check(self):
+            """Silently check for a newer version in the background (version-only:
+            just VERSION.txt, no code downloaded, nothing run) and, if one exists,
+            reveal the footer indicator. Runs off the UI thread so startup is never
+            delayed, and stays quiet on failure/offline.
+
+            Passive by design — it answers 'is there a newer number?' and nothing
+            more. The actual download/run only happens if the user opens the review
+            dialog and clicks Install.
+            """
+            import threading
+
+            def worker():
+                try:
+                    newer = _check_for_update()
+                except Exception:
+                    newer = None
+                # Hop back to the UI thread to touch widgets (Qt isn't thread-safe).
+                QTimer.singleShot(0, lambda: self._on_update_check_done(newer))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def _on_update_check_done(self, newer):
+            if not newer:
+                return
+            self._pending_update = newer
+            self.update_banner.setText("●  A new update is available")
+            self.update_banner.setVisible(True)
+
+        # ── Settings + updates ──────────────────────────────────────────────
+        #
+        # Auto-update is OFF by default and lives behind this dialog. The concern
+        # (raised by users) is real: a tool that downloads and runs code from the
+        # internet on every launch is a supply-chain risk if the repo is ever
+        # compromised. So: opt-in auto-update, and a manual check that CHECKS ONLY
+        # — it shows the patch notes for what's coming and downloads nothing until
+        # the user clicks Install.
+
+        def _open_settings(self):
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Settings")
+            dlg.setMinimumWidth(460)
+            lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(18, 16, 18, 16)
+            lay.setSpacing(12)
+
+            box = QGroupBox("UPDATES")
+            bl = QVBoxLayout(box)
+            bl.setSpacing(10)
+
+            settings = _load_settings()
+            self._chk_auto = TickBox("Automatically check for and install updates on launch")
+            self._chk_auto.setChecked(bool(settings.get("auto_update")))
+            self._chk_auto.toggled.connect(self._on_auto_update_toggled)
+            bl.addWidget(self._chk_auto)
+
+            hint = QLabel(
+                "Off by default. When off, the tool never downloads anything on "
+                "its own — use the button below to check when you want to. Every "
+                "update shows what's changing before it installs.")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color:%s; font-size:10px;" % C_TX2)
+            bl.addWidget(hint)
+
+            row = QHBoxLayout()
+            self._btn_check = QPushButton("Check for updates now")
+            self._btn_check.clicked.connect(self._check_updates_manual)
+            self._lbl_check = QLabel("You're on v%s." % __version__)
+            self._lbl_check.setStyleSheet("color:%s; font-size:11px;" % C_TX2)
+            row.addWidget(self._btn_check)
+            row.addWidget(self._lbl_check, 1)
+            bl.addLayout(row)
+
+            lay.addWidget(box)
+
+            close_row = QHBoxLayout()
+            close_row.addStretch(1)
+            btn_close = QPushButton("Close")
+            btn_close.clicked.connect(dlg.accept)
+            close_row.addWidget(btn_close)
+            lay.addLayout(close_row)
+
+            dlg.exec()
+
+        def _on_auto_update_toggled(self, on):
+            settings = _load_settings()
+            settings["auto_update"] = bool(on)
+            _save_settings(settings)
+
+        def _check_updates_manual(self):
+            """CHECK ONLY: fetch the version + changelog, show the patch notes, and
+            download nothing until the user clicks Install in the review dialog."""
+            self._btn_check.setEnabled(False)
+            self._lbl_check.setText("Checking…")
+            QApplication.processEvents()
+            try:
+                newer = _check_for_update()
+            except Exception:
+                newer = None
+            finally:
+                self._btn_check.setEnabled(True)
+
+            if newer is None:
+                # Distinguish "up to date" from "couldn't reach GitHub".
+                if _http_get(_VERSION_URL, timeout=3) is None:
+                    self._lbl_check.setText("Couldn't reach GitHub — check your connection.")
+                else:
+                    self._lbl_check.setText("You're up to date (v%s)." % __version__)
+                return
+
+            self._lbl_check.setText("v%s is available." % newer)
+            # Also light up the footer indicator (mirrors the launch check).
+            self._pending_update = newer
+            self.update_banner.setText("●  A new update is available")
+            self.update_banner.setVisible(True)
+            self._show_update_review(newer)
+
+        def _release_card(self, ver, body, prev_ref):
+            """One release: version heading, its notes, and a prominent commit
+            button for just THAT release (prev_ref…v{ver}), so a multi-version jump
+            is reviewable release by release."""
+            import webbrowser
+            card = QFrame()
+            # Lighter panel surface so each release reads as its own block against
+            # the dialog. Rounded, subtle border.
+            card.setStyleSheet(
+                "QFrame#card {"
+                " background-color:%s; border:1px solid %s;"
+                " border-radius:8px; }" % (C_PANEL, C_BTNOUT))
+            card.setObjectName("card")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(16, 14, 16, 14)
+            cl.setSpacing(8)
+
+            title = QLabel("v%s" % ver)
+            title.setStyleSheet(
+                "color:#ffffff; font-size:17px; font-weight:800; background:transparent;"
+                " border:none;")
+            cl.addWidget(title)
+
+            # A word-wrapped QLabel sizes to its FULL content with no inner
+            # scrollbar or height guessing (the QTextEdit approach clipped the last
+            # line). The single outer QScrollArea handles any overflow. Notes are
+            # simple bullet/paragraph markdown, so render them as light rich text.
+            notes = QLabel(_md_to_html(body) if body else "<i>No notes for this release.</i>")
+            notes.setWordWrap(True)
+            notes.setTextFormat(Qt.TextFormat.RichText)
+            notes.setStyleSheet(
+                "color:%s; font-size:14px; background:transparent; border:none;" % C_TX0)
+            notes.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            cl.addWidget(notes)
+
+            compare = "%s/compare/v%s...v%s" % (_REPO_URL, prev_ref, ver)
+            btn = QPushButton("Review commits  (v%s → v%s)" % (prev_ref, ver))
+            btn.setObjectName("btn_primary")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet("font-size:14px; font-weight:700; padding:8px 20px;")
+            btn.clicked.connect(lambda _=False, u=compare: webbrowser.open(u))
+            btn_row = QHBoxLayout()
+            btn_row.addWidget(btn)
+            btn_row.addStretch(1)
+            cl.addLayout(btn_row)
+            return card
+
+        def _show_update_review(self, new_version):
+            """Show the patch notes for EVERY incoming version (newest first), each
+            with its own commit link, then Install / Not now. The full download
+            happens only on Install."""
+            # Parse the changelog into just the releases newer than what the user
+            # has. A v1.1 -> v1.5 jump lists 1.5, 1.4, 1.3, 1.2 — each reviewable.
+            releases = _incoming_releases(_fetch_changelog(), __version__)
+
+            dlg = QDialog(self)
+            dlg.setWindowTitle("Update available — v%s" % new_version)
+            dlg.setMinimumSize(620, 540)
+            lay = QVBoxLayout(dlg)
+            lay.setContentsMargins(20, 18, 20, 18)
+            lay.setSpacing(10)
+
+            n = len(releases)
+            head = QLabel("Update to v%s" % new_version)
+            head.setStyleSheet("color:%s; font-size:18px; font-weight:700;" % C_TX0)
+            lay.addWidget(head)
+            if n > 1:
+                sub_txt = ("You're on v%s — this brings %d new versions. Review each "
+                           "below, then install." % (__version__, n))
+            else:
+                sub_txt = ("You're on v%s. Review the changes below, then install."
+                           % __version__)
+            sub = QLabel(sub_txt)
+            sub.setStyleSheet("color:%s; font-size:12px;" % C_TX2)
+            sub.setWordWrap(True)
+            lay.addWidget(sub)
+
+            # Scrollable column of per-release cards.
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            inner = QWidget()
+            col = QVBoxLayout(inner)
+            col.setContentsMargins(0, 0, 6, 0)
+            col.setSpacing(10)
+
+            if releases:
+                # The oldest incoming release compares against the user's CURRENT
+                # version; each newer release compares against the one below it. So
+                # walk oldest→newest to pick each card's "previous" ref, then show
+                # newest→oldest (releases is already newest-first).
+                ordered_old_to_new = list(reversed(releases))
+                prev = __version__
+                prev_ref = {}
+                for ver, _body in ordered_old_to_new:
+                    prev_ref[ver] = prev
+                    prev = ver
+                for ver, body in releases:      # newest first
+                    col.addWidget(self._release_card(ver, body, prev_ref[ver]))
+            else:
+                empty = QLabel("No changelog available for this release.")
+                empty.setStyleSheet("color:%s; font-size:13px;" % C_TX2)
+                col.addWidget(empty)
+            col.addStretch(1)
+
+            scroll.setWidget(inner)
+            lay.addWidget(scroll, 1)
+
+            row = QHBoxLayout()
+            # A single overall commits button covering the whole jump at once —
+            # styled as a plain (non-accent) button so it reads as secondary to the
+            # blue per-release buttons and the primary Install action.
+            import webbrowser
+            allcmp = "%s/compare/v%s...v%s" % (_REPO_URL, __version__, new_version)
+            btn_all = QPushButton("All commits  (v%s → v%s)" % (__version__, new_version))
+            btn_all.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_all.setStyleSheet("font-size:13px; font-weight:600; padding:7px 16px;")
+            btn_all.clicked.connect(lambda _=False, u=allcmp: webbrowser.open(u))
+            row.addWidget(btn_all)
+            row.addStretch(1)
+            btn_later = QPushButton("Not now")
+            btn_later.clicked.connect(dlg.reject)
+            btn_install = QPushButton("Install v%s" % new_version)
+            btn_install.setObjectName("btn_primary")
+            btn_install.clicked.connect(dlg.accept)
+            row.addWidget(btn_later)
+            row.addWidget(btn_install)
+            lay.addLayout(row)
+
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._install_update_now(new_version)
+
+        def _install_update_now(self, new_version):
+            """Download + swap + reload, with a small modal 'installing' notice.
+            Reached only after the user reviewed the notes and clicked Install."""
+            busy = QDialog(self)
+            busy.setWindowTitle("Updating")
+            bl = QVBoxLayout(busy)
+            bl.setContentsMargins(24, 20, 24, 20)
+            msg = QLabel("Downloading v%s and reloading the tool…" % new_version)
+            msg.setStyleSheet("color:%s; font-size:12px;" % C_TX0)
+            bl.addWidget(msg)
+            busy.setModal(True)
+            busy.show()
+            QApplication.processEvents()
+
+            code = _download_and_swap()
+            if code is None:
+                busy.close()
+                QMessageBox.warning(
+                    self, "Update failed",
+                    "Couldn't download or verify the update. Your current version "
+                    "is untouched — try again later, or grab the latest file from "
+                    "the repository.")
+                return
+            # Re-exec the new file in-process. On success this raises SystemExit and
+            # the reloaded copy opens its own window; the current one is torn down.
+            _reexec_updated(code)
 
         def _build_bind_tab(self):
             tab = QWidget()
@@ -5241,6 +5684,10 @@ if _ready:
         win.setWindowFlags(Qt.WindowType.Window)
         win.show()
         win._reclaim_focus()
+
+        # Passive, background version check so the footer can flag a new release.
+        # Skipped in a reloaded child (same _RELOAD_FLAG guard as _check_for_update).
+        win._start_background_update_check()
 
         # Auto-load the Content Browser selection if it's a widget (field then
         # shows just its name). Otherwise the field starts empty — no default path.
