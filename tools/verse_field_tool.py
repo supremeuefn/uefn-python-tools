@@ -32,13 +32,19 @@ import sys
 
 __version__ = "1.1"
 
-# Auto-update source. The tool checks a tiny VERSION file on GitHub raw (a few
-# bytes) on launch; only if it names a newer version does it pull the full file.
+# Auto-update source. This repo hosts SEVERAL tools, so versioning is PER-TOOL,
+# not repo-wide: each tool keeps its own VERSION.txt + CHANGELOG.md in its own
+# folder, and its releases are tagged with a tool-specific prefix. That way a
+# release of another tool never makes this one think it has an update.
 _REPO_URL = "https://github.com/supremeuefn/uefn-python-tools"
 _RAW_BASE = "https://raw.githubusercontent.com/supremeuefn/uefn-python-tools/main"
-_VERSION_URL = _RAW_BASE + "/VERSION.txt"
+_TOOL_DIR = "tools/verse_field"          # this tool's folder in the repo
+_VERSION_URL = _RAW_BASE + "/" + _TOOL_DIR + "/VERSION.txt"
 _TOOL_URL = _RAW_BASE + "/tools/verse_field_tool.py"
-_CHANGELOG_URL = _RAW_BASE + "/CHANGELOG.md"
+_CHANGELOG_URL = _RAW_BASE + "/" + _TOOL_DIR + "/CHANGELOG.md"
+# Git tag prefix for THIS tool's releases (e.g. "verse-field/v1.1"). Drives the
+# per-version "Review commits" compare links.
+_TAG_PREFIX = "verse-field/v"
 _AUTHOR = "SupremeUEFN"
 _AUTHOR_URL = "https://x.com/SupremeUEFN"
 
@@ -4227,7 +4233,8 @@ if _ready:
             notes.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
             cl.addWidget(notes)
 
-            compare = "%s/compare/v%s...v%s" % (_REPO_URL, prev_ref, ver)
+            compare = "%s/compare/%s%s...%s%s" % (
+                _REPO_URL, _TAG_PREFIX, prev_ref, _TAG_PREFIX, ver)
             btn = QPushButton("Review commits  (v%s → v%s)" % (prev_ref, ver))
             btn.setObjectName("btn_primary")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4305,7 +4312,8 @@ if _ready:
             # styled as a plain (non-accent) button so it reads as secondary to the
             # blue per-release buttons and the primary Install action.
             import webbrowser
-            allcmp = "%s/compare/v%s...v%s" % (_REPO_URL, __version__, new_version)
+            allcmp = "%s/compare/%s%s...%s%s" % (
+                _REPO_URL, _TAG_PREFIX, __version__, _TAG_PREFIX, new_version)
             btn_all = QPushButton("All commits  (v%s → v%s)" % (__version__, new_version))
             btn_all.setCursor(Qt.CursorShape.PointingHandCursor)
             btn_all.setStyleSheet("font-size:13px; font-weight:600; padding:7px 16px;")

@@ -1,8 +1,9 @@
 # Changelog
 
-The in-tool **Check for updates** button shows this file so you can see what a
-release changes before installing anything. Each entry links to the commits for
-that release so you can review the actual code.
+Changelog for the **Verse Field Tool** (`tools/verse_field_tool.py`). Versioning
+is per-tool: this file and `VERSION.txt` live alongside the tool and track only
+it. The in-tool **Check for updates** button shows this file so you can see what
+a release changes before installing anything.
 
 ## v1.1
 
@@ -17,7 +18,7 @@ Auto-update is now **opt-in** and safer, based on user feedback.
   downloads nothing until you review the changes and click **Install** — with a
   link to the commit diff so you can see exactly what's coming.
 
-[Review commits: v1.0 → v1.1](https://github.com/supremeuefn/uefn-python-tools/compare/v1.0...v1.1)
+[Review commits: v1.0 → v1.1](https://github.com/supremeuefn/uefn-python-tools/compare/verse-field/v1.0...verse-field/v1.1)
 
 ## v1.0
 
