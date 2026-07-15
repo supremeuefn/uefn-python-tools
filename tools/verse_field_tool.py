@@ -705,7 +705,7 @@ if _ready:
         QGroupBox, QTabWidget, QSpinBox, QMessageBox, QAbstractSpinBox,
         QCheckBox, QDialog, QScrollArea, QFrame,
     )
-    from PySide6.QtCore import Qt, QPointF, QRectF, QTimer
+    from PySide6.QtCore import Qt, QPointF, QRectF, QTimer, Signal
     from PySide6.QtGui import (QColor, QPainter, QPen, QFont, QIntValidator,
                                QDoubleValidator)
 
@@ -3959,6 +3959,12 @@ if _ready:
         return '<span style="color:%s">%s</span>' % (color, text)
 
     class VerseBinderWindow(QMainWindow):
+        # Emitted from the background update-check thread; Qt queues its delivery
+        # onto the GUI thread, which is the only thread-safe way to touch widgets.
+        # (A QTimer started from a plain worker thread has no event loop there and
+        # silently never fires — that was the earlier "banner never shows" bug.)
+        _update_found = Signal(str)
+
         def __init__(self):
             super().__init__()
             self.setWindowTitle("Verse Fields + Binding Tool")
@@ -3978,6 +3984,8 @@ if _ready:
             self._pending_pairs = []
             self._pending_target = None
             self._build_ui()
+            # Queued signal -> GUI-thread slot for the background update check.
+            self._update_found.connect(self._on_update_check_done)
             # Every engine op that reopens the widget raises UEFN over the tool.
             # Registering here (rather than calling _reclaim_focus from each
             # handler) means failure paths -- which return early -- get the focus
@@ -4081,8 +4089,11 @@ if _ready:
                     newer = _check_for_update()
                 except Exception:
                     newer = None
-                # Hop back to the UI thread to touch widgets (Qt isn't thread-safe).
-                QTimer.singleShot(0, lambda: self._on_update_check_done(newer))
+                if newer:
+                    # Emitting a signal is the thread-safe hand-off to the GUI
+                    # thread; Qt queues it. (Only emit on a hit so the slot's guard
+                    # stays simple and we never queue a no-op.)
+                    self._update_found.emit(newer)
 
             threading.Thread(target=worker, daemon=True).start()
 
