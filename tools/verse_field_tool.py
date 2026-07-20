@@ -11,7 +11,10 @@ re-run in-process, so the update lands on the same run. Current version below.
 
 Binds Verse fields to ENGINE PROPERTIES (Text, ColorAndOpacity, ...), to
 SUB-WIDGET FIELDS on embedded child widgets (same type only), or to button
-EVENTS — one at a time, zipped in pairs, or in bulk by `#`-numbered patterns.
+EVENTS — including buttons nested one level down inside a sub-widget instance
+(the event's WidgetName is the instance; a two-segment EventPath reaches the
+inner button by its VarGuid) — one at a time, zipped in pairs, or in bulk by
+`#`-numbered patterns (a sub-widget button is indexed by its INSTANCE name).
 Bindings needing a conversion NODE (texture/material -> Brush) cannot be
 authored (the subsystem has no setters for them); they are listed LOCKED.
 
@@ -1063,6 +1066,11 @@ if _ready:
     # ColorAndOpacity from UUserWidget rather than declaring it themselves.
     _CLASS_MODULE = {
         "FortCTAButton": "/Script/FortniteUI",
+        # Delegate-declaring classes for EVENT bindings (EventPath MemberParent).
+        # CommonButtonBase declares OnButtonBaseClicked for the UEFN buttons; the
+        # native Custom Button declares its own OnButtonClicked.
+        "CommonButtonBase": "/Script/CommonUI",
+        "UIFrameworkCustomButtonWidget": "/Script/UIFramework",
     }
 
     def _class_path(class_name):
@@ -1476,6 +1484,95 @@ if _ready:
             seen.add(name)
             out.append({"name": name, "class_path": class_path,
                         "child_wbp_path": child_wbp, "fields": fields})
+        return out
+
+    def _is_sub_widget_instance(class_path):
+        """True iff this class path is an EMBEDDED user-widget instance.
+
+        Its class is a generated Blueprint class (ends "_C", lives in a content
+        package, NOT /Script/…) and is not a native-derived widget. Same test
+        list_child_widgets uses, factored out so button discovery agrees with it.
+        """
+        bare = class_path.strip().strip("'")
+        if bare.startswith("/Script/") or not bare.endswith("_C"):
+            return False
+        return _native_base(class_path) is None
+
+    _child_button_guids_cache = {}
+
+    def _child_widget_var_guids(child_wbp_path):
+        """{widget name -> VarGuid} for every widget in a child WBP.
+
+        Read from the child's WidgetVariableNameToGuidMap in its T3D export —
+        the same GUID the editor writes into a sub-widget event's first path
+        segment (MemberGuid). A zeroed one there makes the event fail to
+        generate, so this is not optional.
+        """
+        if child_wbp_path in _child_button_guids_cache:
+            return _child_button_guids_cache[child_wbp_path]
+        guids = {}
+        try:
+            wbp = _el.load_asset(child_wbp_path)
+            if wbp is not None:
+                text = _export_t3d(wbp)
+                m = re.search(r'WidgetVariableNameToGuidMap=\((.*?)\)\r?\n', text)
+                if m:
+                    guids = {n: g for n, g in re.findall(
+                        r'"([^"]+)",\s*([A-F0-9]{32})', m.group(1))}
+        except Exception:
+            guids = {}
+        _child_button_guids_cache[child_wbp_path] = guids
+        return guids
+
+    def list_sub_widget_event_buttons(wbp_path, entries=None):
+        """Buttons that live INSIDE embedded sub-widgets, as event sources.
+
+        A parent Verse event field can bind a button nested one level down in a
+        sub-widget instance. The editor encodes that as a TWO-segment EventPath
+        (WidgetName = the instance; segment 1 = the inner button on the child's
+        generated class, carrying the button's VarGuid; segment 2 = the delegate).
+        Only one level deep — that is what the editor's binding panel offers.
+
+        Each row is shaped like a list_event_widgets row so the UI and matchers
+        treat it uniformly, plus the sub-widget keys the disk patcher needs:
+          sub_widget   the instance name in the PARENT tree (WidgetName)
+          sub_class    the instance's generated class (segment-1 MemberParent)
+          button_var   the button's own name inside the child (segment-1 MemberName)
+          button_guid  the button's VarGuid (segment-1 MemberGuid) — required
+        """
+        out, seen = [], set()
+        for class_path, name in (entries if entries is not None
+                                 else _widget_tree_entries(wbp_path)):
+            if name in seen or not _is_sub_widget_instance(class_path):
+                continue
+            seen.add(name)
+            child_wbp = _class_path_to_asset(class_path)
+            guids = _child_widget_var_guids(child_wbp)
+            try:
+                child_entries = _widget_tree_entries(child_wbp)
+            except Exception:
+                continue
+            for c_class, c_name in child_entries:
+                delegates = widget_event_delegates(c_class)
+                if not delegates:
+                    continue
+                guid = guids.get(c_name)
+                if not guid:
+                    continue      # no VarGuid -> segment 1 cannot resolve; skip
+                native = c_class.rsplit(".", 1)[-1].rstrip("'")
+                # `name` (the row's "widget") is the PARENT-tree instance the
+                # binding's WidgetName references; the display shows the path.
+                out.append({
+                    "name": name, "class_path": class_path, "native": native,
+                    "display": "%s · %s" % (
+                        name, _widget_display_name(c_name, native)),
+                    "label": _widget_class_label(native),
+                    "delegates": delegates,
+                    "sub_widget": name,
+                    "sub_class": _wrap_generated_class(class_path),
+                    "button_var": c_name,
+                    "button_guid": guid,
+                })
         return out
 
     def is_direct_bindable(verse_type, native, prop_name):
@@ -2416,13 +2513,25 @@ if _ready:
     # DELEGATE, not per widget: a UEFN button inherits OnButtonBaseClicked from
     # CommonButtonBase but declares OnButtonCTAHighlight on ITSELF — mapping the
     # whole widget to one class makes the compiler report <None> for the other.
-    _DELEGATE_ANCESTORS = ("CommonButtonBase",)
+    # Ordered SHALLOWEST-match-first by intent: OnButtonBaseClicked is declared on
+    # CommonButtonBase (both button shapes inherit it), but OnButtonCTAHighlight /
+    # OnButtonCTAUnhighlight are declared on FortCTAButton (the UEFN buttons' base).
+    # The first ancestor that declares the delegate wins, and no delegate is
+    # declared on BOTH, so order only has to list every real declarer. Confirmed
+    # against editor-made bindings: Clicked -> CommonButtonBase, Highlight /
+    # Unhighlight -> FortCTAButton, for flat AND sub-widget buttons alike.
+    _DELEGATE_ANCESTORS = ("CommonButtonBase", "FortCTAButton")
 
     def _delegate_declaring_classes(wbp_path):
         """(widget, delegate) -> the class that declares that delegate, asked of
-        the engine (never pattern-matched from the name)."""
+        the engine (never pattern-matched from the name).
+
+        Covers top-level buttons AND sub-widget buttons: for the latter the key is
+        the sub-widget INSTANCE name (Slot1), which is what an event's WidgetName
+        and every addition use. Both row shapes carry name/native/delegates."""
         owners = {}
-        for w in list_event_widgets(wbp_path):
+        for w in (list_event_widgets(wbp_path)
+                  + list_sub_widget_event_buttons(wbp_path)):
             for delegate, _label in w["delegates"]:
                 owner = w["native"]           # leaf class, unless an ancestor owns it
                 for ancestor in _DELEGATE_ANCESTORS:
@@ -2821,12 +2930,36 @@ if _ready:
         """(widget, field[, delegate[, value]])
         -> (widget, field, delegate or None, value or None).
 
+        `widget` is normally the target widget's object name (a str). For a
+        button nested in a sub-widget it is instead a DICT carrying the nested
+        path parts (sub_widget/sub_class/button_var/button_guid) -- _sub_meta
+        pulls those out, and the "widget" the rest of the code sees becomes the
+        sub-widget INSTANCE name (the binding's WidgetName).
+
         `value` is the argument the button passes to a parameterised event --
         the MVVM panel's "Param 0" box -- as text ("7", "2.5", "true").
         """
         return (addition[0], addition[1],
                 addition[2] if len(addition) > 2 else None,
                 addition[3] if len(addition) > 3 else None)
+
+    def _sub_meta(widget):
+        """A sub-widget addition's nested-path parts, or None for a flat button.
+
+        Accepts the dict an event-widget ROW carries (list_sub_widget_event_buttons)
+        and returns just the keys the disk seeder needs, or None when `widget` is a
+        plain object-name string.
+        """
+        if not isinstance(widget, dict):
+            return None
+        return {"sub_widget": widget["sub_widget"], "sub_class": widget["sub_class"],
+                "button_var": widget["button_var"],
+                "button_guid": widget["button_guid"]}
+
+    def _addition_widget_name(widget):
+        """The binding's WidgetName for an addition: the instance name for a
+        sub-widget button, or the widget's own object name for a flat one."""
+        return widget["sub_widget"] if isinstance(widget, dict) else widget
 
     def _retarget_event_in_package(pkg, event_name, widget, field, delegate,
                                    declaring_class=None, graph=None):
@@ -2911,17 +3044,39 @@ if _ready:
         'ContextId=00000000000000000000000000000000,Source=SelfContext,'
         'bIsComponent=False,bDeprecatedSource=True)' % (_SEED_FIELD, "0" * 32))
 
-    def _seed_first_event(wbp_path):
-        """Give a widget with NO events a template to clone, using the engine, so
-        the user need not hand-author the first one. MVVMEditorSubsystem.add_event
-        does the structural work -- appends a real export AND registers it in the
-        view's Events array (a virgin view omits Events entirely, leaving the
-        patcher no array to grow).
+    # A sub-widget button's EventPath has TWO segments: segment 1 names the
+    # button on the CHILD's generated class (with the button's VarGuid — a zeroed
+    # one there fails to generate), segment 2 the delegate. WidgetName is the
+    # sub-widget INSTANCE in the parent tree. The editor writes exactly this shape
+    # for a nested-button binding; feeding it back through add_event's shell makes
+    # the engine serialize the nested path structure a flat template lacks.
+    def _sub_widget_event_path(sub_class, button_var, button_guid,
+                               delegate_parent, delegate, widget_name):
+        return (
+            '(Paths=('
+            '(BindingReference=(MemberParent="%s",MemberName="%s",MemberGuid=%s),'
+            'BindingKind=Property),'
+            '(BindingReference=(MemberParent="%s",MemberName="%s"),'
+            'BindingKind=Property)'
+            '),WidgetName="%s",'
+            'ContextId=00000000000000000000000000000000,Source=Widget,'
+            'bIsComponent=False,bDeprecatedSource=True)'
+            % (sub_class, button_var, button_guid,
+               delegate_parent, delegate, widget_name))
 
-        The shell is not quite a template: EventPath and DestinationPath serialize
-        (import_text bypasses their read-only guard), but GraphName has no such
-        door, stays None, and an unset FName is not written at all.
-        _finish_seed_event injects that one tag on disk.
+    def _seed_event_with_paths(wbp_path, event_path, dest_path):
+        """Seed ONE event via the engine with caller-supplied paths; return its name.
+
+        MVVMEditorSubsystem.add_event does the structural work -- appends a real
+        export AND registers it in the view's Events array (a virgin view omits
+        Events entirely, leaving the patcher no array to grow). EventPath and
+        DestinationPath serialize (import_text bypasses their read-only guard),
+        but GraphName has no such door, stays None, and an unset FName is not
+        written at all -- _finish_seed_event injects that one tag on disk.
+
+        Used both for the FIRST flat event on a virgin widget and for every
+        sub-widget-button event (whose two-segment path a flat template cannot
+        be retargeted into -- the extra segment carries more bytes and a GUID).
         """
         wbp = _el.load_asset(wbp_path)
         subsystem = unreal.get_editor_subsystem(unreal.MVVMEditorSubsystem)
@@ -2934,8 +3089,8 @@ if _ready:
 
         # get_editor_property on a UObject hands back the LIVE struct, so
         # import_text edits the event itself -- no (refused) set_editor_property.
-        event.get_editor_property("event_path").import_text(_SEED_EVENT_PATH)
-        event.get_editor_property("destination_path").import_text(_SEED_DEST_PATH)
+        event.get_editor_property("event_path").import_text(event_path)
+        event.get_editor_property("destination_path").import_text(dest_path)
 
         _bel.compile_blueprint(wbp)
         _save_regenerating_tags(wbp_path)
@@ -2945,6 +3100,10 @@ if _ready:
         if not new:
             raise RuntimeError("the seed event did not persist")
         return new[0]
+
+    def _seed_first_event(wbp_path):
+        """Give a widget with NO events a template to clone (flat placeholder)."""
+        return _seed_event_with_paths(wbp_path, _SEED_EVENT_PATH, _SEED_DEST_PATH)
 
     # A GraphName NameProperty tag: [FName name][FName "NameProperty"]
     # [int32 ArrayIndex][int32 value size = 8][byte flags][FName value] = 33 bytes.
@@ -3128,13 +3287,16 @@ if _ready:
 
     @_keeps_editor_open
     def create_event_bindings(wbp_path, additions):
-        """Create new events. `additions` = [(widget, field[, delegate])];
+        """Create new events. `additions` = [(widget, field[, delegate[, value]])];
         a missing delegate keeps the template's.
 
-        Each event is a CLONE of an existing one. A widget with none gets a
-        template first, built by the engine (_seed_first_event) and completed on
-        disk, so this works on a widget that has never had an event binding.
-        Patched via _patch_on_disk (backup restored on failure).
+        A flat-button event is a CLONE of an existing one; a widget with none gets
+        a template first, built by the engine (_seed_first_event) and completed on
+        disk. A SUB-WIDGET-button event (its `widget` is a dict, see _event_addition)
+        cannot be cloned from a flat template -- its EventPath has an extra segment
+        and a GUID -- so it is SEEDED through the engine with the full nested path
+        and only finished on disk. Patched via _patch_on_disk (backup restored on
+        failure).
         """
         # `_values` pairs each created event with the value it is owed, for the
         # second pass below; it is popped before returning, so the result shape
@@ -3145,9 +3307,9 @@ if _ready:
             return result
 
         def prepare():
-            # Runs with the asset loaded, inside _patch_on_disk's rollback: both
-            # calls need the engine API / the widget tree, and seeding WRITES a
-            # placeholder event, so a failure after this point must undo it.
+            # Runs with the asset loaded, inside _patch_on_disk's rollback: every
+            # call here needs the engine API / the widget tree, and seeding WRITES
+            # placeholder events, so a failure after this point must undo them.
             declaring = _delegate_declaring_classes(wbp_path)
 
             # field -> parameter kind (int/float/logic) or None, read from the
@@ -3157,24 +3319,56 @@ if _ready:
             # Refuse a delegate the widget does not declare, BEFORE writing
             # anything: the two button shapes spell the same event differently
             # (OnButtonCTAHighlight vs OnButtonHighlight), and a mismatch compiles
-            # to an unresolvable "<None>" delegate with only a log warning.
+            # to an unresolvable "<None>" delegate with only a log warning. A
+            # sub-widget button's declaring map is keyed by its INSTANCE name.
             for addition in additions:
                 widget, field, delegate, value = _event_addition(addition)
-                if delegate and (widget, delegate) not in declaring:
-                    known = sorted(d for w, d in declaring if w == widget)
+                name = _addition_widget_name(widget)
+                if delegate and (name, delegate) not in declaring:
+                    known = sorted(d for w, d in declaring if w == name)
                     raise RuntimeError(
                         "%s does not declare %s -- it has %s"
-                        % (widget, delegate, ", ".join(known) or "no events"))
-                # A value needs a pin to hold it, and the FIELD decides whether
-                # there is one. Catch it here, before anything is written.
+                        % (name, delegate, ", ".join(known) or "no events"))
                 if value is not None and not params.get(field):
                     raise RuntimeError(
                         "%s takes no parameter, so %s cannot pass it a value"
-                        % (field, widget))
+                        % (field, name))
 
-            seed = (None if list_event_bindings(wbp_path)
-                    else _seed_first_event(wbp_path))
-            return seed, declaring, params
+            # Seed every sub-widget event through the engine NOW (asset loaded),
+            # each with its own nested EventPath. Its dest MemberGuid is zeroed --
+            # the compiler resolves the field by name. The returned export names
+            # feed patch(), which only finishes GraphName + pins for them.
+            sub_seeds = []           # (event_name, widget_dict, field, delegate, value)
+            for addition in additions:
+                widget, field, delegate, value = _event_addition(addition)
+                meta = _sub_meta(widget)
+                if meta is None:
+                    continue
+                deleg = delegate or resolve_delegate(
+                    meta["sub_widget"], _SEED_DELEGATE, declaring)
+                # The class DECLARING this delegate, wrapped as its import path --
+                # CommonButtonBase for the UEFN buttons, the Custom Button for its
+                # own OnButtonClicked. Falls back to CommonButtonBase (the seed's
+                # default) if the map has no entry, which prepare() already vetted.
+                owner = declaring.get((meta["sub_widget"], deleg))
+                dparent = _class_path(owner) if owner else _SEED_PARENT
+                event_path = _sub_widget_event_path(
+                    meta["sub_class"], meta["button_var"], meta["button_guid"],
+                    dparent, deleg, meta["sub_widget"])
+                dest_path = (
+                    '(Paths=((BindingReference=(MemberName="%s",MemberGuid=%s,'
+                    'bSelfContext=True))),WidgetName="",'
+                    'ContextId=00000000000000000000000000000000,Source=SelfContext,'
+                    'bIsComponent=False,bDeprecatedSource=True)' % (field, "0" * 32))
+                ev_name = _seed_event_with_paths(wbp_path, event_path, dest_path)
+                display = widget.get("display", meta["sub_widget"])
+                sub_seeds.append((ev_name, display, field, value))
+
+            # Only FLAT additions still need a clone template / first-event seed.
+            flat = [a for a in additions if _sub_meta(_event_addition(a)[0]) is None]
+            seed = (None if (sub_seeds or list_event_bindings(wbp_path))
+                    else (_seed_first_event(wbp_path) if flat else None))
+            return seed, declaring, params, sub_seeds, flat
 
         def resolve_delegate(widget, delegate, declaring):
             """Translate an INHERITED delegate to the one `widget` really declares.
@@ -3196,8 +3390,21 @@ if _ready:
             return delegate      # unknown group: leave it, prepare() already vetted
 
         def patch(pkg, prepared):
-            seed, declaring, params = prepared
-            pending = list(additions)
+            seed, declaring, params, sub_seeds, flat = prepared
+
+            # Sub-widget seeds already carry the correct nested path + dest field;
+            # only GraphName and (for parameterised fields) a pin remain. Finishing
+            # is all the disk work they need -- no retarget.
+            for ev_name, display, field, value in sub_seeds:
+                _finish_seed_event(pkg, ev_name, "__" + str(uuid.uuid4()))
+                _apply_param_value(pkg, ev_name, field, value, params)
+                result["created"].append((ev_name, display, field))
+                if params.get(field):
+                    result["_values"].append(
+                        (ev_name, value if value is not None
+                         else _EVENT_PARAM_DEFAULTS[params[field]]))
+
+            pending = list(flat)
 
             if seed is not None:
                 # The seed is a shell until its GraphName tag exists; without it
@@ -3347,8 +3554,13 @@ if _ready:
         for n in sorted(set(fields_by_n) & set(targets_by_n)):
             fs, ts = fields_by_n[n], targets_by_n[n]
             if len(fs) > 1 or len(ts) > 1:
+                # Prefer a target's display name so a multi-button sub-widget reads
+                # "Slot1 · Custom Button / Slot1 · UEFN Button Quiet" -- not the
+                # useless "Slot1 / Slot1" the bare instance names would give. The
+                # per-class Event target resolves it; the message points there.
                 warnings.append("index %d ambiguous: %s / %s"
-                                % (n, [f["name"] for f in fs], [t["name"] for t in ts]))
+                                % (n, [f["name"] for f in fs],
+                                   [t.get("display", t["name"]) for t in ts]))
                 continue
             pair = pair_fn(fs[0], ts[0], warnings)
             if pair is not None:
@@ -3376,9 +3588,18 @@ if _ready:
                               pair, "widget", "field")
 
     def match_events_by_suffix(fields, event_widgets, field_pattern, widget_pattern,
-                               delegate_label):
+                               delegate_label, button_native=None):
         """Pair EVENT fields with buttons by a shared index ("VF_Click#" x
-        "Button#" x "On Clicked"). Returns ([(field, widget, delegate)], [warnings])."""
+        "Button#" x "On Clicked"). Returns ([(field, widget, delegate)], [warnings]).
+
+        `button_native` disambiguates a sub-widget that holds MORE THAN ONE button:
+        both buttons share the same instance name (Slot1), so Slot# would match two.
+        Filtering to one button class first makes the index unique again -- the UI
+        offers it as a distinct target ("Event (Custom Button) · On Clicked")."""
+        widgets = event_widgets
+        if button_native is not None:
+            widgets = [w for w in event_widgets
+                       if w.get("sub_widget") and w["native"] == button_native]
         def pair(field, widget, warnings):
             # The same event is spelled differently per button shape, so resolve
             # the label against THIS widget's own delegates.
@@ -3387,11 +3608,16 @@ if _ready:
             if delegate is None:
                 warnings.append("%s has no %s event" % (widget["name"], delegate_label))
                 return None
-            return (field["name"], widget["name"], delegate)
+            # A sub-widget button passes its whole dict (nested-path parts);
+            # create_event_bindings' _sub_meta reads them. A flat button passes
+            # just its object name. The batch index came from the sub-widget
+            # INSTANCE name (Slot#) either way -- that is _index_by_pattern's key.
+            ref = widget if widget.get("sub_widget") else widget["name"]
+            return (field["name"], ref, delegate)
         return _match_indexed(
             _index_by_pattern([f for f in fields if f["type"] == "event"],
                               field_pattern),
-            _index_by_pattern(event_widgets, widget_pattern),
+            _index_by_pattern(widgets, widget_pattern),
             pair, "widget", "event field")
 
     def match_child_by_suffix(fields, child_widgets, field_pattern, child_pattern,
@@ -4447,6 +4673,11 @@ if _ready:
 
             fbox = QGroupBox("VERSE FIELDS   (multi-select for pairing)")
             fl = QVBoxLayout(fbox)
+            self.field_search = QLineEdit()
+            self.field_search.setPlaceholderText("Search fields…  (name, type or category)")
+            self.field_search.setClearButtonEnabled(True)
+            self.field_search.textChanged.connect(self._refresh_fields)
+            fl.addWidget(self.field_search)
             frow = QHBoxLayout()
             frow.addWidget(QLabel("Category:"))
             self.category_filter = ArrowCombo()
@@ -4465,6 +4696,11 @@ if _ready:
 
             tbox = QGroupBox("BINDABLE TARGETS   (multi-select to zip with fields)")
             tl = QVBoxLayout(tbox)
+            self.target_search = QLineEdit()
+            self.target_search.setPlaceholderText("Search targets…  (widget, class or event)")
+            self.target_search.setClearButtonEnabled(True)
+            self.target_search.textChanged.connect(self._refresh_targets)
+            tl.addWidget(self.target_search)
             self.tbl_targets = QTableWidget(0, 4)
             self.tbl_targets.setHorizontalHeaderLabels(["Widget", "Class", "Target", "Current"])
             self._setup_table(self.tbl_targets, multi=True)
@@ -4647,6 +4883,11 @@ if _ready:
             box = QGroupBox("MANAGE FIELDS   —   recategorize or delete existing "
                             "Verse fields (multi-select)")
             gl = QVBoxLayout(box)
+            self.manage_search = QLineEdit()
+            self.manage_search.setPlaceholderText("Search fields…  (name, type or category)")
+            self.manage_search.setClearButtonEnabled(True)
+            self.manage_search.textChanged.connect(self._refresh_manage)
+            gl.addWidget(self.manage_search)
             self.tbl_manage = QTableWidget(0, 3)
             self.tbl_manage.setHorizontalHeaderLabels(["Field", "Type", "Category"])
             self.manage_sort = SortHeader(0, lambda _s: self._refresh_manage())
@@ -4715,9 +4956,12 @@ if _ready:
                 combo.setCurrentIndex(-1)
 
         def _refresh_manage(self):
-            # Rows map to _manage_rows, not _fields — the sort may reorder them.
+            # Rows map to _manage_rows, not _fields — the sort may reorder them,
+            # and the search filters them.
+            query = self.manage_search.text().strip()
             self._manage_rows = self._apply_sort(
-                list(self._fields), self.manage_sort.state)
+                [f for f in self._fields if self._field_matches(f, query)],
+                self.manage_sort.state)
             self._fill_field_rows(self.tbl_manage, self._manage_rows)
             self._fill_category_combo(self.manage_category)
 
@@ -4844,11 +5088,12 @@ if _ready:
                     self.target_combo.addItem("Sub-widget · %s" % name,
                                               ("child", name))
 
-            # Event targets. Offer each label once, no matter how the buttons spell it.
+            # Event targets. Offer each label once, no matter how the buttons spell
+            # it; a sub-widget holding >1 button class also gets per-class entries.
             if "event" in types:
-                for label in sorted({label for w in self._pattern_event_widgets()
-                                     for _d, label in w["delegates"]}):
-                    self.target_combo.addItem("Event · %s" % label, ("event", label))
+                for text, data in self._event_targets_for(
+                        self._pattern_event_widgets()):
+                    self.target_combo.addItem(text, data)
 
         def _matched(self, items):
             """The `items` whose names match the current widget pattern.
@@ -4871,6 +5116,48 @@ if _ready:
 
         def _pattern_event_widgets(self):
             return self._matched(self._event_widgets)
+
+        @staticmethod
+        def _event_targets_for(event_widgets):
+            """[(combo text, data)] event targets for a set of event widgets.
+
+            Each delegate LABEL is offered once (buttons spell the same event
+            differently, but the label is uniform). When sub-widget buttons under
+            the matched instances span MORE THAN ONE class, a per-class entry is
+            added so Slot# can pick one button per slot -- otherwise Slot# would
+            match two and the batch bails as ambiguous. Data is ("event", label)
+            for the plain target, ("event", label, native) for a class-scoped one.
+            """
+            labels = sorted({label for w in event_widgets
+                             for _d, label in w["delegates"]})
+            # Distinct button classes among the SUB-WIDGET buttons only. One class
+            # (or none) needs no disambiguation -- Slot# is already unique. The
+            # matcher keys on the CLASS (button_native), but the label uses the
+            # button's own NAME (what the bindable list shows) -- every slot shares
+            # the sub-widget class, so a class maps to ONE button name.
+            sub_natives = sorted({w["native"] for w in event_widgets
+                                  if w.get("sub_widget")})
+            name_of = {}
+            for w in event_widgets:
+                if w.get("sub_widget"):
+                    name_of.setdefault(w["native"], w.get("button_var", w["native"]))
+
+            # Plain (any-button) entries FIRST, grouped by delegate; then one group
+            # PER button, each listing its delegates. Reads top-to-bottom as "the
+            # simple targets, then ButtonQuiet's, then NewCustomButton's" rather
+            # than interleaving a button's events between the plain ones.
+            out = [("Event · %s" % label, ("event", label)) for label in labels]
+            if len(sub_natives) > 1:
+                for native in sub_natives:
+                    for label in labels:
+                        # Only when THIS class actually declares THIS label.
+                        if any(w["native"] == native and w.get("sub_widget")
+                               and lbl == label
+                               for w in event_widgets for _d, lbl in w["delegates"]):
+                            out.append((
+                                "Event (%s) · %s" % (name_of.get(native, native), label),
+                                ("event", label, native)))
+            return out
 
         def _pattern_field_types(self):
             """Verse types of the fields the current field pattern actually matches.
@@ -4977,8 +5264,11 @@ if _ready:
                 return match_child_by_suffix(self._fields, self._child_widgets,
                                              fpat, wpat, data[1])
             if data[0] == "event":
+                # data = ("event", label) or ("event", label, sub_button_native).
+                native = data[2] if len(data) > 2 else None
                 return match_events_by_suffix(self._fields, self._event_widgets,
-                                              fpat, wpat, data[1])
+                                              fpat, wpat, data[1],
+                                              button_native=native)
             return match_by_suffix(self._fields, self._widgets, fpat, wpat, data[2])
 
         def _all_bulk_targets(self):
@@ -4989,8 +5279,10 @@ if _ready:
                     out += [("native", cls, prop) for prop in _BULK_PROPS[cls]]
             out += [("child", name) for name in
                     sorted({f["name"] for c in self._child_widgets for f in c["fields"]})]
-            out += [("event", label) for label in
-                    sorted({l for w in self._event_widgets for _d, l in w["delegates"]})]
+            # Every event target (plain + per-class for multi-button sub-widgets),
+            # from the same builder the combo uses so the two never diverge.
+            out += [data for _text, data in
+                    self._event_targets_for(self._event_widgets)]
             return out
 
         def _log(self, msg, color=None):
@@ -5079,12 +5371,16 @@ if _ready:
             # Child fields can change between loads (fields added to the child
             # widget); the cache is only valid within a single load.
             _child_fields_cache.clear()
+            _child_button_guids_cache.clear()
             try:
                 fields = list_verse_fields(path)
                 entries = _widget_tree_entries(path)   # one T3D export for all three
                 widgets = list_widgets(path, entries)
                 children = list_child_widgets(path, entries)
-                event_widgets = list_event_widgets(path, entries)
+                # Top-level buttons AND buttons nested one level down inside
+                # embedded sub-widgets — both source events, listed together.
+                event_widgets = (list_event_widgets(path, entries)
+                                 + list_sub_widget_event_buttons(path, entries))
             except Exception as exc:
                 self._log("Load failed: %s" % exc, C_ERR)
                 return
@@ -5147,10 +5443,28 @@ if _ready:
             return sorted(fields, key=lambda f: cls._name_key(f["name"]),
                           reverse=(state == SORT_DESC))
 
+        @staticmethod
+        def _field_matches(field, query):
+            """Case-insensitive substring over a field's name, type and category.
+
+            Type includes the parameter ("event (int)"), so "int" finds an int
+            event field. An empty query matches everything."""
+            if not query:
+                return True
+            q = query.lower()
+            kind = field["type"]
+            if field.get("param"):
+                kind = "%s (%s)" % (kind, field["param"])
+            hay = " ".join((field["name"], kind, field.get("category", "Default")))
+            return q in hay.lower()
+
         def _refresh_fields(self):
             cat = self.category_filter.currentText()
-            self._visible_fields = [f for f in self._fields
-                                    if cat == "All" or f.get("category", "Default") == cat]
+            query = self.field_search.text().strip()
+            self._visible_fields = [
+                f for f in self._fields
+                if (cat == "All" or f.get("category", "Default") == cat)
+                and self._field_matches(f, query)]
             self._visible_fields = self._apply_sort(
                 self._visible_fields, self.fields_sort.state)
             self._fill_field_rows(self.tbl_fields, self._visible_fields)
@@ -5178,6 +5492,27 @@ if _ready:
             rows = self.tbl_fields.selectionModel().selectedRows()
             return [self._visible_fields[r.row()]
                     for r in sorted(rows, key=lambda x: x.row())]
+
+        def _filter_target_rows(self, rows):
+            """Keep the target rows matching the Bindable-Targets search box.
+
+            Matches over what the row SHOWS: its widget/display name, its class
+            label, and the destination (property, child field, or -- for an event
+            row -- every delegate label the row offers). Empty query = all rows."""
+            query = self.target_search.text().strip().lower()
+            if not query:
+                return rows
+            out = []
+            for row in rows:
+                parts = [row.get("display", row.get("widget", "")),
+                         _widget_class_label(row.get("native", "")),
+                         row.get("dest", "")]
+                # Event rows have no single dest -- their pickable events are the
+                # delegate labels; make those searchable too.
+                parts += [label for _d, label in row.get("delegates", ())]
+                if query in " ".join(parts).lower():
+                    out.append(row)
+            return out
 
         def _refresh_targets(self):
             """Rebuild the target table for the (first) selected field + mode.
@@ -5228,6 +5563,7 @@ if _ready:
                                  "child_field": cf["name"], "dest": cf["name"],
                                  "bindable": True, "src": src, "has_conv": has_conv})
 
+            rows = self._filter_target_rows(rows)
             self._target_rows = rows
             self.tbl_targets.setRowCount(len(rows))
             for r, row in enumerate(rows):
@@ -5387,8 +5723,13 @@ if _ready:
                              # gets one seeded (see _seed_first_event), so the
                              # first binding no longer has to be made in the UI.
                              "bindable": True,
-                             "has_conv": False})
+                             "has_conv": False,
+                             # The full event-widget dict, kept so a SUB-WIDGET
+                             # button row can pass its nested-path parts through
+                             # to create_event_bindings (see _event_target_ref).
+                             "event_widget": w})
 
+            rows = self._filter_target_rows(rows)
             self._target_rows = rows
             self.tbl_targets.setRowCount(len(rows))
             for r, row in enumerate(rows):
@@ -5502,11 +5843,12 @@ if _ready:
                 values = self._param_values(field, len(fresh))
                 additions = []
                 for i, t in enumerate(fresh):
-                    addition = (t["widget"], field["name"], t["delegate"])
+                    addition = (self._event_target_ref(t), field["name"],
+                                t["delegate"])
                     if values is not None:
                         addition += (values[i],)
                         self._log("  %s  →  %s   Param 0 = %s"
-                                  % (t["widget"], field["name"], values[i]))
+                                  % (t["display"], field["name"], values[i]))
                     additions.append(addition)
                 self._run_create_events(additions)
                 return
@@ -5538,14 +5880,15 @@ if _ready:
                 additions = []
                 for i, (f, t) in enumerate(zip(fields, targets)):
                     # Pass the row's OWN delegate, or a clone keeps the template's.
-                    addition = (t["widget"], f["name"], t["delegate"])
+                    addition = (self._event_target_ref(t), f["name"],
+                                t["delegate"])
                     note = ""
                     if values is not None:
                         addition += (values[i],)
                         note = "   Param 0 = %s" % values[i]
                     additions.append(addition)
                     self._log("  pair  %s  →  %s.%s%s"
-                              % (f["name"], t["widget"], t["delegate"], note))
+                              % (f["name"], t["display"], t["delegate"], note))
                 self._run_create_events(additions)
                 return
             pairs = [self._row_to_pair(f["name"], t) for f, t in zip(fields, targets)]
@@ -5608,12 +5951,30 @@ if _ready:
             self._refresh_targets()
 
         @staticmethod
+        def _event_target_ref(row):
+            """What create_event_bindings should receive as an addition's "widget".
+
+            A SUB-WIDGET button row passes its whole event-widget DICT (nested-path
+            parts); a top-level button passes just its object name. _event_addition
+            and _sub_meta branch on which it gets.
+            """
+            ew = row.get("event_widget")
+            if ew is not None and ew.get("sub_widget"):
+                return ew
+            return row["widget"]
+
+        @staticmethod
         def _pair_label(pair):
             """(field, widget, dest) label for a native tuple, child dict or event tuple."""
             if isinstance(pair, dict):
                 return pair["field"], pair["widget"], pair["child_field"]
             if len(pair) == 3:                 # event: (field, widget, delegate)
-                return pair
+                field, widget, delegate = pair
+                # An event pair's widget is a sub-widget DICT for a nested button;
+                # show its "Slot1 · Button" display instead of the raw dict.
+                if isinstance(widget, dict):
+                    widget = widget.get("display", widget.get("sub_widget", "?"))
+                return field, widget, delegate
             field, widget, _native, prop = pair
             return field, widget, prop
 
