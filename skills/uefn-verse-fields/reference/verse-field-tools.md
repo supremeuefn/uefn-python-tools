@@ -16,12 +16,13 @@ This document is the authoritative reference for programmatically managing Verse
 6. [Verse Event Fields](#verse-event-fields)
 7. [The crash vice](#the-crash-vice--create-then-unload)
 8. [Deleting Variables — Safe Method](#deleting-variables--safe-method)
-9. [Reading Verse Fields](#reading-verse-fields)
-10. [MVVM Bindings](#mvvm-bindings)
-11. [Event Bindings — the disk layer](#event-bindings--the-disk-layer)
-12. [Memory Layout Reference](#memory-layout-reference)
-13. [Critical Warnings — What NOT To Do](#critical-warnings--what-not-to-do)
-14. [Complete Working Examples](#complete-working-examples)
+9. [Renaming a Verse field](#renaming-a-verse-field)
+10. [Reading Verse Fields](#reading-verse-fields)
+11. [MVVM Bindings](#mvvm-bindings)
+12. [Event Bindings — the disk layer](#event-bindings--the-disk-layer)
+13. [Memory Layout Reference](#memory-layout-reference)
+14. [Critical Warnings — What NOT To Do](#critical-warnings--what-not-to-do)
+15. [Complete Working Examples](#complete-working-examples)
 
 ---
 
@@ -805,6 +806,83 @@ unreal.BlueprintEditorLibrary.remove_unused_variables(wbp)
 
 ---
 
+## Renaming a Verse field
+
+A **plain** Verse field can be renamed in place — no delete + recreate — because its public
+name lives in metadata, not in the member's FName. `validate_renames(path, pairs)` is the
+dry-run (name conflicts, event-field refusals); `rename_verse_fields(path, pairs)` mutates.
+
+### Rename a plain field by rewriting ONLY its `DisplayName` value
+
+The public Verse name of a plain field **is** its `DisplayName` metadata value — the third
+metadata entry patched at create time (see [*Patching Verse Metadata*](#patching-verse-metadata)).
+Rewrite just that FString value and the field is renamed. Everything else on the descriptor
+is left alone.
+
+**Verified on disk:** after the rewrite the saved `VerseClassFields` tag reads
+`(Name="<new>",InternalName="<old>",...)` — `Name` flips to the new public name while
+`InternalName` (the member's `VarName`) stays the old name. A `.verse` reference resolves
+against the **public** name (`Name`), so the rename takes effect; the stale `InternalName` is
+**cosmetic only** for plain fields. (MVVM **property** bindings do NOT resolve against the
+public name — they reference the member's *internal* name + GUID, which is unchanged; see
+*No binding repoint*, below.)
+
+> **The member `VarName` FName at descriptor offset 0 is NEVER patched.** That is the
+> forbidden edit — `memmove`-ing or otherwise rewriting the FName at offset 0 corrupts the
+> engine's name table and crashes on the next compile/save (see
+> [*Critical Warnings #1*](#1-never-create-variables-as-real-then-try-to-memory-patch-their-vartype)).
+> A `DisplayName`-only rewrite sidesteps it entirely — the value FString is heap data you own,
+> not an interned name index.
+
+Reuse the metadata machinery from *Patching Verse Metadata*: rebuild the descriptor's
+`MetaDataArray` block with the same keys and the new `DisplayName` string, keeping the field's
+`PropertyFlags` (`65541`) unchanged.
+
+### Event fields are REFUSED for in-place rename
+
+An **event** field's public name is structurally tied to two things a `DisplayName` rewrite
+does not touch — the member named `VerseFieldInternalVariable_<name>` and the function graph
+named `<name>` (see [*Verse Event Fields*](#verse-event-fields)). Neither is safely renameable
+from Python, so `validate_renames` flags any event field in the batch and
+`rename_verse_fields` refuses it, telling the user to **delete + recreate** instead.
+
+### No binding repoint is needed (verified)
+
+A plain-field rename touches **no** bindings, because nothing a binding references changes:
+
+- **Property bindings** reference their source field by the member's **internal name + GUID**
+  (the `SourcePath` `MemberName` is the *internal* name — for a plain field the `VarName`,
+  which the rename leaves untouched — plus a real `MemberGuid`). A DisplayName-only rename does
+  not change either, so the binding keeps resolving. Measured: after renaming `VF_Slot1Name` →
+  `VF_TitleText`, the Slot binding still reads `MemberName="VF_Slot1Name"` and compiles clean.
+  **Do NOT rewrite it to the new public name — there is no member by that name, and the binding
+  would break.**
+- **Event bindings** reference the field by its **public** name (the `DestinationPath`
+  `MemberName`) — so a rename *would* need to repoint them. But only **event** fields are
+  event-bound, and event fields are refused for rename (above), so no event binding ever points
+  at a renamed (plain) field. Nothing to do.
+
+`rename_verse_fields` therefore rewrites `DisplayName` and nothing else.
+
+### ⚠ Crash trap — do NOT detach the MetaDataArray before saving
+
+Counter-intuitive but measured: **detaching before the save strips the rename.** The engine
+serializes each field's metadata **from the array its descriptor points at**, so if you null
+the `MetaDataArray` (offset 200) before `_save_regenerating_tags`, the emptied array is written
+and the field keeps its **old** `DisplayName` — the rename silently doesn't take. Mirror
+CREATE, which patches metadata and saves **without** detaching: rebuild the block, leave the
+ctypes buffer **attached** (it lives in `_KEEP` for the session — safe on its own), compile,
+and `_save_regenerating_tags` (**never** `save_asset`, which silently demotes the field — see
+[*Saving*](#saving--save_asset-demotes-your-fields)).
+
+Detach is only mandatory before a later **unload / `reload_packages` / GC** (the crash vice —
+those free the attached buffer → `EXCEPTION_ACCESS_VIOLATION`; see
+[*The crash vice*](#the-crash-vice--create-then-unload)). `rename_verse_fields` does none of
+those, so it never detaches. **This also bites TEST scripts:** never call `reload_packages`
+after a rename/create to "verify" — read the saved `.uasset` from a separate process instead.
+
+---
+
 ## Reading Verse Fields
 
 Reading is safe and does not modify memory:
@@ -1086,22 +1164,120 @@ keep = [b for b in view.get_editor_property('bindings') if <predicate>]
 view.set_editor_property('bindings', keep)
 ```
 
-### Bindings needing a conversion NODE cannot be created from Python
+## Conversion bindings — SOLVED, creatable from Python (2026-07-15)
 
-`texture`→`Brush` and `material`→`Brush` use `MVVMK2Node_MakeBrushFromSoftTexture` /
-`...SoftMaterial`, not conversion *functions*. Evidence:
+> Earlier versions of this file said conversion-*node* bindings (`texture`/`material` →
+> `Brush`) "cannot be created from Python — do them in the editor UI." **That was wrong.**
+> All conversion bindings — node AND function — are now creatable, verified end-to-end
+> (`BS_UP_TO_DATE`, persisted, re-read after reload). Use
+> `verse_fields.create_conversion_bindings()`.
 
-* `get_available_conversion_functions(texture, Brush)` returns `[]`, while
-  `(logic, Visibility)` correctly returns 10 including `Conv_BoolToSlateVisibility`.
-* The existing binding's `conversion_function` reads
-  `(FunctionReference=(...empty...),Node="...MVVMK2Node_MakeBrushFromSoftMaterial'",Type=Node)`
-  — versus `Type=Function` + populated `FunctionReference` for library conversions.
-* `MVVMEditorSubsystem` exposes `get_conversion_function{,_node,_graph}` — **getters
-  only**. There is no setter.
+The claim rested on a false premise: that you would have to synthesize the 7-node
+`EdGraph`. **You don't. The graph is never serialized.** Its node classes
+(`MVVMK2Node_AreSourcesValidForBinding`, `K2Node_GeneratedBoundEvent`, `K2Node_VariableGet`)
+do not appear anywhere in the saved `.uasset` — not even in the name table. **The engine
+REGENERATES the graph on compile** from one small data object. Author the object; the graph
+builds itself.
 
-Creating one means synthesizing a 7-node `EdGraph` (bound event, the MVVM node, an
-`MVVMK2Node_AreSourcesValidForBinding` gate, variable get/set, self) with wired pins.
-Do it in the editor UI.
+### The object
+
+A conversion binding is an ordinary binding with an **empty `SourcePath`** whose
+`Conversion.SourceToDestinationConversion` names an `MVVMBlueprintViewConversionFunction`
+(a real UObject outered to the WidgetBlueprint — `unreal.new_object(..., outer=wbp)`).
+The **real source lives on one of its `SavedPins`**, not in `SourcePath`.
+
+All six of its properties are `[Read-Only]`, but three take `import_text` on the **live**
+struct handed back by `get_editor_property` (the same door `MVVMBlueprintViewBinding.SourcePath`
+uses), and `saved_pins` is a **live array that accepts `.append()`**:
+
+| Field | How to write it |
+|---|---|
+| `conversion_function` | `import_text` — `Type=Function` + `FunctionReference`, or `Type=Node` + `Node=` |
+| `destination_path` | `import_text` — same shape as a binding's DestinationPath |
+| `saved_pins` | live array; build `unreal.MVVMBlueprintPin()`, `import_text`, `.append()` |
+| **`graph_name`** | **ctypes — see below. This is the whole difficulty.** |
+| `is_ubergraph_page` / `wrapper_graph_transient` | **don't** — the engine derives both from the conversion type, correctly |
+
+### ⚠ GraphName: read-only, and the engine HARD-ASSERTS on it
+
+Leave it `None` (what `new_object` gives you) and the engine trips
+
+```
+Ensure condition failed: !GraphName.IsNone()
+MVVMBlueprintViewConversionFunction.cpp:388
+```
+
+then dereferences null on the next UI redraw — `EXCEPTION_ACCESS_VIOLATION reading 0xe0`,
+**editor gone**. It is *not* an output the engine backfills; it must be valid **before
+anything reads the object**. (It does get auto-filled if you compile, but by then the ensure
+has already fired and the editor dies on the next repaint. Do not rely on that.)
+
+The name is **derived from the binding's own id**, not arbitrary:
+
+```
+__<BindingId as a lowercase dashed GUID>_SourceToDest[_Async]
+```
+
+`_Async` iff the conversion is a **K2Node** (every Brush/Texture node); a library `Conv_*`
+**function** gets the plain suffix. E.g. `BindingId=6EA1372D4D7C2CC70997C68B58D5C6EE` →
+`__6ea1372d-4d7c-2cc7-0997-c68b58d5c6ee_SourceToDest_Async`.
+
+Writing it needs a **real FName index** — you cannot invent one, it must exist in the
+engine's global name table. Get the engine to allocate it: `MVVMBlueprintPin.import_text()`
+interns any string, and the index is then readable out of that pin's `PinNames` TArray
+(ptr/count/max at struct offset 0). Then ctypes it into the object at **offsets 256 and 264**
+(GraphName + a cached copy; write both). Verify by reading `graph_name` back through the
+reflection API — it will read your string.
+
+```python
+def _intern_fname(text):                      # -> (index, number)
+    pin = unreal.MVVMBlueprintPin()
+    pin.import_text('(Id=(PinNames=("%s")),DefaultString="",Status=Valid)' % text)
+    ptr, count, _ = struct.unpack_from("<qii", bytes(
+        (ctypes.c_ubyte * 16).from_address(_obj_address(pin))), 0)
+    return struct.unpack_from("<II", bytes((ctypes.c_ubyte * 8).from_address(ptr)), 0)
+```
+
+`_obj_address` just parses the `(0x…)` that UObject/struct `repr()` already prints.
+Offsets 256/264 are **build-specific** — re-derive them (diff a fresh object against a real
+one) if a UEFN update breaks the read-back assert.
+
+### The four conversion kinds
+
+| Kind | `conversion_function` | Pins (in order) |
+|---|---|---|
+| Make Brush From Soft **Material** | `Type=Node`, `MVVMK2Node_MakeBrushFromSoftMaterial` | `Material`\*, `Width`, `Height` |
+| Make Brush From Soft **Texture** | `Type=Node`, `MVVMK2Node_MakeBrushFromSoftTexture` | `Texture`\*, `Width`, `Height` |
+| **Set Soft Texture Parameter** | `Type=Node`, `MVVMK2Node_SetSoftTextureParameter` | `TargetBrush`†, `ParameterName`, `Texture`\* |
+| **To Visibility (Boolean)** | `Type=Function`, `VerseFortniteUIAllowedConversionLibrary.Conv_BoolToSlateVisibility` | `bIsVisible`\*, `TrueVisibility`, `FalseVisibility` |
+
+\* the source field's pin. † see below.
+
+**Every non-source pin takes EITHER a literal (`DefaultString`) OR a Verse field (a `Path`)** —
+the exact same structure as the source pin. So `Width`/`Height` can be bound to `int` fields,
+`ParameterName` to a string field, `TrueVisibility`/`FalseVisibility` to fields, and so on.
+That is what the chain-link icon beside each row in the panel does.
+
+`TrueVisibility`/`FalseVisibility` accept: `Visible`, `Collapsed`, `Hidden`,
+`HitTestInvisible`, `SelfHitTestInvisible`.
+
+**† `TargetBrush` is NOT engine-filled, despite being greyed out in the panel.** It is an
+explicitly serialized `Path` that is a **verbatim copy of the `destination_path`**
+(`Image3.Brush`, `Source=Widget`). Omit it and you get a binding that compiles clean
+(`BS_UP_TO_DATE`) and **silently does nothing**. `ParameterName` must also match a texture
+parameter that actually exists **in the material** — a typo fails at runtime, not at compile.
+
+### Other facts
+
+* The source pin's `MemberGuid` can be **zeroed** — the compiler resolves it by name and
+  writes the real GUID back, exactly as for ordinary bindings.
+* `get_available_conversion_functions(texture, Brush)` returns `[]` while `(logic, Visibility)`
+  returns 10. That is real, but it only means Brush conversions aren't library *functions* —
+  it never implied they were uncreatable.
+* `MVVMEditorSubsystem` has `get_conversion_function{,_node,_graph}` and **no setter**. Also
+  real, and also not a wall: you never go through the subsystem, you author the object.
+* A binding whose destination is already taken must be **replaced**, not appended — one
+  destination holds at most one binding.
 
 ### Legacy recipe below — DOES NOT WORK, kept for reference
 
@@ -1373,6 +1549,47 @@ in that file.
 re-parse it, re-serialize it, and require byte-identity. This catches whole classes of
 table-maintenance bugs (it caught the thumbnail-offset and depends-table bugs above as a 3-byte
 diff). Run it from a **separate process** — no editor needed, and it cannot crash one.
+
+### Sub-widget button events — the two-segment EventPath
+
+A parent Verse event field can bind a button nested **one level down** inside an embedded
+sub-widget instance (e.g. the button inside each `Slot1…Slot5`). The parent's widget tree only
+lists the *instances* — the inner button is **not** addressable by a bare `WidgetName`, so a
+single-segment path fails (`Index=-1`). The editor encodes it as a **two-segment `Paths` array**:
+
+```
+Paths=(
+  (BindingReference=(MemberParent="/Script/UMG.WidgetBlueprintGeneratedClass'/Proj/WC_Slot.WC_Slot_C'",
+                     MemberName="ButtonQuiet", MemberGuid=6C0C0E39…), BindingKind=Property),   # segment 1: the inner button
+  (BindingReference=(MemberParent="/Script/CoreUObject.Class'/Script/CommonUI.CommonButtonBase'",
+                     MemberName="OnButtonBaseClicked"), BindingKind=Property)                  # segment 2: the delegate
+),
+WidgetName="Slot1"                                                                              # the INSTANCE in the parent tree
+```
+
+The moving parts, all editor-verified (real `event_key`, survives fresh reload + recompile):
+
+- **`WidgetName`** = the sub-widget **instance** name (`Slot1`), same as a sub-widget *field* binding.
+- **Segment 1** = `MemberParent` the child's **generated class** (`WidgetBlueprintGeneratedClass'…_C'`),
+  `MemberName` the button's own **variable name inside the child**, and `MemberGuid` the button's
+  **`VarGuid`**. That GUID is **REQUIRED** — a zeroed one fails to generate (unlike a *destination*
+  field GUID, which the compiler re-resolves by name). Read it offline from the child WBP's
+  **`WidgetVariableNameToGuidMap`** in its T3D export — no mutation needed.
+- **Segment 2** = the delegate, with `MemberParent` its **declaring class** (`CommonButtonBase` for
+  the UEFN buttons' `OnButtonBaseClicked`; **`FortCTAButton`** for `OnButtonCTAHighlight`/`Unhighlight`;
+  the **Custom Button** for its own `OnButtonClicked`/`OnButtonHighlight`/`OnButtonUnhighlight`).
+
+**Don't hand-build the nested path in raw bytes.** A flat single-segment template cannot be
+FName-retargeted into it (the extra segment carries more bytes *and* a GUID). Instead **seed each
+sub-widget event through the engine** — `add_event` + `import_text` with the full two-segment
+`event_path` — which serializes the nested structure correctly, then finish `GraphName` (and any
+param pin) on disk exactly as for a flat event. Discover candidates (with their button `VarGuid`)
+via `list_sub_widget_event_buttons(path)`.
+
+Parameterised events work unchanged (the Param 0 value rides in `SavedPins` as always; verified
+sticking on a sub-widget button). When a sub-widget holds **more than one button**, the instance
+name alone is ambiguous — disambiguate by the button's **class** (both buttons of a slot share the
+instance name but differ in class).
 
 ---
 

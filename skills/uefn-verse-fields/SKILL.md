@@ -48,6 +48,11 @@ verse_fields.list_verse_fields(path)         # name / type / ue5_class / categor
 verse_fields.verify_verse_fields(path, names)
 verse_fields.delete_verse_fields(path, names)
 
+# Rename PLAIN fields — DisplayName rewrite only; no binding repoint needed.
+# Event fields are REFUSED (delete + recreate instead). See "Renaming a plain field", below.
+verse_fields.validate_renames(path, [("VF_Old", "VF_New")])   # dry-run: conflicts / event-field refusals
+verse_fields.rename_verse_fields(path, [("VF_Old", "VF_New")])
+
 # Event bindings (button -> Verse event field) — patched on disk, see the reference
 verse_fields.list_event_widgets(path)        # only widgets whose CDO declares a delegate
 verse_fields.list_event_bindings(path)
@@ -60,6 +65,14 @@ verse_fields.remove_event_bindings(path, ...)
 verse_fields.create_event_bindings(path, [
     ("Slot1", "VF_OnPick", "OnButtonClicked", "1"),
     ("Slot2", "VF_OnPick", "OnButtonClicked", "2"),
+])
+
+# A button NESTED inside an embedded sub-widget can source an event too. Pass a
+# DICT instead of the widget name — its keys carry the nested EventPath parts.
+verse_fields.list_sub_widget_event_buttons(path)   # discovers them, with button VarGuid
+verse_fields.create_event_bindings(path, [
+    ({"sub_widget": "Slot1", "sub_class": gen_class, "button_var": "ButtonQuiet",
+      "button_guid": "6C0C0E39…"}, "VF_ClickEvent1", "OnButtonBaseClicked"),
 ])
 ```
 
@@ -134,9 +147,78 @@ now solved and verified end-to-end:
   `.uasset` **on disk** with pure Python (no .NET, no UAssetGUI). Create, retarget, and
   remove all work, including on a widget that has never had an event.
   See *Event Bindings — the disk layer* in the reference.
+- **Sub-widget button events** — a parent event field can bind a button nested one level
+  down inside an embedded sub-widget instance. The `EventPath` becomes **two segments**
+  (WidgetName = the instance; segment 1 = the inner button on the child's generated class,
+  carrying the button's `VarGuid`; segment 2 = the delegate on its declaring class). The
+  segment-1 GUID is **required** — a zeroed one fails to generate. `add_event`+`import_text`
+  with the full nested path serializes it correctly; finish `GraphName` on disk as usual.
+  See *Sub-widget button events* in the reference.
 
-What genuinely remains UI-only: **`texture`/`material` → `Brush`** property bindings,
-which need an MVVM conversion *node*.
+## Conversion bindings ARE possible too (2026-07-15)
+
+The last "UI-only" claim — **`texture`/`material` → `Brush`**, needing an MVVM conversion
+*node* — **is also solved.** Nothing about Verse fields or MVVM bindings is UI-only now.
+
+The 7-node `EdGraph` never had to be synthesized: it is **not serialized at all** (its node
+classes are not even in the package's name table). The engine **regenerates it on compile**
+from a single `MVVMBlueprintViewConversionFunction` object, so you only author that object —
+`conversion_function`, `destination_path` and `saved_pins` all take `import_text` /
+`.append()` on the live object.
+
+The one real trap is **`GraphName`**: `[Read-Only]` *and* the engine hard-asserts on it
+(`Ensure condition failed: !GraphName.IsNone()`, `MVVMBlueprintViewConversionFunction.cpp:388`).
+Leave it unset and the editor dies — `EXCEPTION_ACCESS_VIOLATION reading 0xe0` on the next
+redraw. It is derived, not arbitrary (`__<BindingId as a dashed lowercase guid>_SourceToDest`,
+`_Async` for K2Node conversions), and is written by interning an FName via
+`MVVMBlueprintPin.import_text` then ctypes-ing it to offsets 256/264.
+
+All four kinds work. Every **non-source pin** (`Width`, `Height`, `ParameterName`,
+`TrueVisibility`, …) takes **either a literal or a bound Verse field**. Read *Conversion
+bindings* in the reference before using this — the `TargetBrush` pin fails **silently** if
+you omit it.
+
+```python
+verse_fields.list_conversion_bindings(path)
+verse_fields.create_conversion_bindings(path, [
+    {"kind": "brush_material", "field": "VF_MaterialVar", "widget": "Image2"},
+    {"kind": "brush_texture",  "field": "VF_TextureVar",  "widget": "Image1",
+     "pins": {"Width": "256", "Height": {"field": "VF_IconHeight"}}},   # literal OR field
+    {"kind": "texture_parameter", "field": "VF_TextureVar", "widget": "Image3",
+     "pins": {"ParameterName": "Icon"}},          # must exist IN THE MATERIAL
+    {"kind": "visibility", "field": "VF_LogicVar", "widget": "Text1",
+     "pins": {"FalseVisibility": "Hidden"}},
+])
+verse_fields.remove_conversion_bindings(path, [("Image2", "Brush")])
+```
+
+## Renaming a plain field ARE possible (2026-07)
+
+A **plain** Verse field can be renamed in place — no delete/recreate — by rewriting **only
+its `DisplayName` metadata value**. Verified on disk: the saved `VerseClassFields` tag flips
+`Name="<new>"` while `InternalName="<old>"` (the member's `VarName`) stays put. The public
+Verse name (what a `.verse` reference resolves) changes; the member `VarName` FName at
+descriptor offset 0 is **never patched** (that is the forbidden, crash-inducing patch — see
+*Critical Warnings #1*). The stale `InternalName` is cosmetic only for plain fields.
+
+- **Event fields are REFUSED for in-place rename.** Their public name is structurally tied
+  to the `VerseFieldInternalVariable_<name>` member and a function graph named `<name>`,
+  neither of which is safely renameable — the tool tells the user to delete + recreate.
+- **No binding repoint is needed** (verified). A property binding references its source field
+  by the member's **internal name + GUID**, which a DisplayName-only rename leaves untouched —
+  so it keeps resolving with no change. Event bindings reference the field by its **public**
+  name, but only *event* fields are event-bound and those are refused for rename, so no event
+  binding ever points at a renamed (plain) field. `rename_verse_fields` touches no bindings.
+- **Crash trap — do NOT detach before saving.** The engine serializes each field's metadata
+  *from the array its descriptor points at*, so an emptied (detached) `MetaDataArray` written
+  to disk strips the new `DisplayName` and the field keeps its **old** name (measured). Mirror
+  CREATE: patch metadata, then compile + `_save_regenerating_tags` (never `save_asset`) with
+  the buffer **still attached**; it stays in `_KEEP` for the session. Detach is only for a
+  later unload/reload/GC (the crash vice), which rename does not do. See *Renaming a Verse
+  field* in the reference.
+
+`validate_renames(path, pairs)` is the dry-run — it reports name conflicts and event-field
+refusals before `rename_verse_fields(path, pairs)` mutates anything.
 
 ## What to read before each task
 
@@ -145,9 +227,12 @@ which need an MVVM conversion *node*.
 | Create variables (any type) | *Creating Variables*, *Type Mapping*, *Patching Verse Metadata* |
 | Create an **event** field | *Verse Event Fields* |
 | Delete variables | *Deleting Variables — Safe Method* |
+| Rename a **plain** field | *Renaming a Verse field* |
 | Read what fields exist | *Reading Verse Fields* |
-| Read or create **property** bindings | *MVVM Bindings* (note: Brush bindings **cannot** be made from Python) |
+| Read or create **property** bindings | *MVVM Bindings* |
+| Create/remove **conversion** bindings (Brush, Visibility) | *Conversion bindings* — note the silent `TargetBrush` trap |
 | Create/retarget/remove **event** bindings | *Event Bindings — the disk layer* |
+| Bind a button **inside a sub-widget** to an event | *Sub-widget button events* |
 | Set a variable's category | *Variable Category* |
 | Debugging a crash / stale offsets | *Critical Warnings*, *Memory Layout Reference* |
 
@@ -214,7 +299,7 @@ which need an MVVM conversion *node*.
 - Read bindings with `get_view()` (read-only); `request_view()` **creates** a view (mutation).
 - Bindings that use a conversion function serialize with an **empty `SourcePath`** — the real
   source lives on a pin of the conversion node's `EdGraph`. Don't report them as sourceless.
-- **No conversion needed** (bindable directly from Python): `message`→`Text`,
+- **No conversion needed** (plain `apply_bindings`): `message`→`Text`,
   `color`/`color_alpha`→`ColorAndOpacity`, `float`→`RenderOpacity`.
 - **The UEFN buttons (Loud/Quiet/Regular) bind `Text`** — their label, no conversion. They
   are **not** UMG widgets: they derive from `FortCTAButton`, which lives in
@@ -226,15 +311,22 @@ which need an MVVM conversion *node*.
   `Text` is the only property the editor offers on a button — offer only that. The plain
   **Custom Button** is a different lineage and has no `Text` at all. See *The UEFN buttons
   bind `Text`* in the reference.
-- **Conversion required**: `logic`→`Visibility`, `texture`→`Brush`, `material`→`Brush`.
-- `texture`/`material`→`Brush` use MVVM conversion **nodes** (`MVVMK2Node_MakeBrushFrom…`),
-  not functions, and **cannot be created from Python** — do them in the editor UI.
+- **Conversion required** (`create_conversion_bindings`): `logic`→`Visibility`,
+  `texture`→`Brush`, `material`→`Brush`. `texture`/`material`→`Brush` use MVVM conversion
+  **nodes** (`MVVMK2Node_MakeBrushFrom…`) rather than functions — which is a real difference,
+  but **not** a barrier: all of them are now creatable from Python. See *Conversion bindings
+  ARE possible too*, above.
 - **Field-to-field bindings ARE Python-scriptable, including `texture`→`texture`.** A parent
   field bound to an **embedded child widget's** same-type Verse field needs no conversion —
   the Brush conversion node lives inside the child, so the parent→child hop is plain
   property-to-property. Destination `BindingReference` names the child's generated class as
   `MemberParent` and the child field as `MemberName`, with `WidgetName="<InstanceName>"`,
   `Source=Widget`. See *Field-to-field bindings* in the reference.
+- **Event bindings can reach a button INSIDE an embedded sub-widget** — the mirror of the
+  field-to-field case, but for an event. The `EventPath` gains a first segment naming the inner
+  button on the child's generated class (with its `VarGuid`, which is *required*), before the
+  delegate segment; `WidgetName` is the instance. Seed via the engine with the full nested path.
+  See *Sub-widget button events* in the reference.
 - **To replicate a UI-made binding across N instances**: clone the existing binding's
   `export_text()`, swap source `MemberName` + dest `WidgetName`, **zero the source
   `MemberGuid`** (compiler re-resolves it by name on compile — avoids the protected
