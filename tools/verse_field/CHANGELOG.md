@@ -5,7 +5,7 @@ is per-tool: this file and `VERSION.txt` live alongside the tool and track only
 it. The in-tool **Check for updates** button shows this file so you can see what
 a release changes before installing anything.
 
-## Unreleased (v1.2 draft)
+## v1.2
 
 **Batch rename Verse fields in Manage Fields.** Rename many fields at once,
 right where you already manage them:
@@ -17,8 +17,8 @@ right where you already manage them:
 - **Live preview with conflict detection.** The new names are shown before you
   commit, and any collision — with an existing field or with another rename in
   the batch — is flagged so nothing is applied until it's resolved.
-- **Bindings are repointed automatically** — both property bindings and event
-  bindings that reference a renamed field follow it, no manual re-wiring.
+- **Bindings keep working automatically.** A property binding follows its field
+  through the rename with no manual re-wiring.
 - **Plain fields only.** Event fields can't be renamed in place (their public
   name is tied to internal machinery), so they're refused with a note to
   **delete and recreate** instead.
