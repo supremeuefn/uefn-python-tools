@@ -7,48 +7,13 @@ a release changes before installing anything.
 
 ## v1.2
 
-**Batch rename Verse fields in Manage Fields.** Rename many fields at once,
-right where you already manage them:
-
-- **Three rename modes** — **Find & Replace** (swap a substring across every
-  matching name), **Prefix/Suffix** (add or strip a prefix or suffix), and
-  **Renumber** (re-sequence numbered fields, so `VF_Slot2…VF_Slot10` renumber
-  cleanly).
-- **Live preview with conflict detection.** The new names are shown before you
-  commit, and any collision — with an existing field or with another rename in
-  the batch — is flagged so nothing is applied until it's resolved.
-- **Bindings keep working automatically.** A property binding follows its field
-  through the rename with no manual re-wiring.
-- **Plain fields only.** Event fields can't be renamed in place (their public
-  name is tied to internal machinery), so they're refused with a note to
-  **delete and recreate** instead.
-
-**Event bindings now reach buttons inside sub-widgets.**
-
-- A button nested one level down in an embedded sub-widget instance (e.g. the
-  button inside each `Slot1`…`Slot5`) can now source a parent Verse **event**
-  field — previously only top-level buttons showed up. They appear in the event
-  target list as `Slot1 · Button`, in both the single/pair binding flow and the
-  bulk `#`-numbered flow.
-- **Bulk numbering keys on the sub-widget instance** (`VF_ClickEvent#` ×
-  `Slot#`), mirroring how sub-widget *field* bulk binding already works — so
-  `VF_ClickEvent1` → Slot1's button, `VF_ClickEvent2` → Slot2's, and so on.
-- **Multi-button sub-widgets are disambiguated in the Target dropdown.** When a
-  sub-widget holds more than one button, the Target list adds per-button entries
-  named for the button (e.g. `Event (NewCustomButton) · On Clicked`), so `Slot#`
-  resolves to exactly one button per slot and the whole batch binds cleanly. (The
-  plain `Event · On Clicked` stays for single-button slots.)
-- Works for **both** button shapes (the UEFN Loud/Quiet/Regular buttons and the
-  Custom Button) and **all three** events (On Clicked, On Highlight, On
-  Unhighlight). Parameterised events (Param 0) are supported in the single and
-  Bind-Selected-Pairs flows — the bulk-by-number flow binds the event only.
-
-**Search boxes.** Filter long lists as you type:
-
-- **Verse Fields** and **Manage Fields** — search by field name, type (so `int`
-  finds an int event field) or category.
-- **Bindable Targets** — search by widget name, class, or event (delegate label);
-  e.g. `custom`, `highlight`, `slot3`.
+- **Batch rename fields** in Manage Fields — Find & Replace, Prefix/Suffix, or
+  Renumber, with a live preview and conflict checks. Bindings keep working;
+  plain fields only.
+- **Event bindings reach buttons inside sub-widgets** — single, paired, or bulk
+  by number, for both button types and all three events. Multi-button slots pick
+  the button in the Target dropdown.
+- **Search boxes** on the Verse Fields, Bindable Targets, and Manage Fields lists.
 
 ## v1.1
 
