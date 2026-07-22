@@ -1442,6 +1442,14 @@ if _ready:
             short = short[:-2]
         return "%s.%s" % (pkg, short) if short else pkg
 
+    def _asset_object_name(asset_path):
+        """"/NewTesting/WC_Slot.WC_Slot" -> "WC_Slot" (display only).
+
+        An asset path's tail is already "Name.Name", so trimming only the
+        package would show the name twice in the CLASS column.
+        """
+        return asset_path.rsplit("/", 1)[-1].split(".", 1)[-1]
+
     # MemberParent in a child binding always uses the wrapped generated-class form.
     _GEN_CLASS_WRAP = "/Script/UMG.WidgetBlueprintGeneratedClass'%s'"
 
@@ -1466,8 +1474,16 @@ if _ready:
     def list_child_widgets(wbp_path, entries=None):
         """Embedded USER-widget instances that expose Verse fields.
 
-        [{name, class_path, child_wbp_path, fields:[{name,type}]}]. Native widgets
-        (Image/TextBlock/…) are excluded — those are handled by list_widgets.
+        [{name, class_path, child_wbp_path, fields:[{name,type}]}].
+
+        Membership is decided by "does its own WBP declare Verse fields?", NOT by
+        whether it derives from a native widget. A subclassed UEFN button
+        (WC_CustomQuietButton, deriving FortCTAButton) is BOTH a native-derived
+        widget AND a user widget carrying its own Verse fields -- excluding
+        anything with a native base hid that field entirely, leaving only the
+        inherited `Text` property bindable. Such a widget legitimately appears in
+        this list AND in list_widgets; the two describe different targets on the
+        same instance (its Verse field vs. its native property).
         """
         out, seen = [], set()
         for class_path, name in (entries if entries is not None
@@ -1475,12 +1491,9 @@ if _ready:
             if name in seen:
                 continue
             # A user sub-widget instance: its class is a generated Blueprint class
-            # (ends "_C", lives in a content package, NOT /Script/…) and is not a
-            # native-derived widget (those are engine props, handled elsewhere).
+            # (ends "_C", lives in a content package, NOT /Script/…).
             bare = class_path.strip().strip("'")
             if bare.startswith("/Script/") or not bare.endswith("_C"):
-                continue
-            if _native_base(class_path) is not None:
                 continue
             child_wbp = _class_path_to_asset(class_path)
             fields = _child_verse_fields(child_wbp)
@@ -2550,13 +2563,26 @@ if _ready:
         return owners
 
     def _package_events(pkg):
-        """[(export, {widget,delegate,field,graph[,parent]} -> byte offset)].
+        """[(export, {widget,delegate,field,graph[,button,parent]} -> byte offset)].
 
-        EventPath serializes before DestinationPath: the FIRST MemberName is the
-        widget's delegate, the LAST is the Verse field. `parent` is EventPath's
-        MemberParent — the package index of the class DECLARING the delegate;
-        a clone crossing button types must rewrite it or the compiler reports
-        the delegate as <None> and the event will not generate.
+        EventPath serializes before DestinationPath, and the LAST MemberName is
+        always the Verse field. How many come before it depends on the button:
+
+          flat button       (delegate, field)                     2 members
+          sub-widget button (button_var, delegate, field)          3 members
+
+        so the delegate is the SECOND-TO-LAST member, never `members[0]` — on a
+        sub-widget event that first slot is the inner button's variable name
+        (CustomButtonQuiet), and reading it as the delegate makes every such
+        binding invisible to the UI and corrupts any retarget that writes it.
+        `button` is that first segment, present only for a sub-widget event; it
+        is what tells two buttons inside ONE instance apart.
+
+        `parent` is the DELEGATE segment's MemberParent — the package index of
+        the class DECLARING the delegate; a clone crossing button types must
+        rewrite it or the compiler reports the delegate as <None> and the event
+        will not generate. It is matched to the delegate segment positionally,
+        for the same reason the delegate itself is.
         """
         events = []
         for export in pkg.exports:
@@ -2569,14 +2595,20 @@ if _ready:
             if len(members) < 2 or not widgets or not graphs:
                 continue          # an empty shell the editor made but never filled
             slots = {
-                "delegate": members[0] + _NAME_VALUE_GAP,
+                "delegate": members[-2] + _NAME_VALUE_GAP,
                 "field": members[-1] + _NAME_VALUE_GAP,
                 "widget": widgets[0] + _NAME_VALUE_GAP,
                 "graph": graphs[0] + _NAME_VALUE_GAP,
             }
+            if len(members) > 2:
+                slots["button"] = members[-3] + _NAME_VALUE_GAP
             if parents:
-                # Same 25-byte tag->value gap as an FName property's.
-                slots["parent"] = parents[0] + _NAME_VALUE_GAP
+                # Same 25-byte tag->value gap as an FName property's. Take the
+                # parent that sits with the DELEGATE segment: MemberParent is
+                # written once per path segment, so on a sub-widget event
+                # parents[0] belongs to the button segment, not the delegate.
+                index = min(len(members), len(parents)) - 2
+                slots["parent"] = parents[index] + _NAME_VALUE_GAP
             # A parameterised event carries the panel's "Param 0" value here.
             # Absent on a parameterless one -- there is no pin to give a value.
             pin = pkg.find_tag(export, _PIN_DEFAULT_TAG)
@@ -2665,7 +2697,12 @@ if _ready:
         return name
 
     def list_event_bindings(wbp_path):
-        """[{event, widget, delegate, field, value}] for every MVVM event.
+        """[{event, widget, button, delegate, field, value}] for every MVVM event.
+
+        `button` is the button variable INSIDE `widget` for a sub-widget event,
+        else None for a flat one -- `widget` alone cannot identify the source
+        when one instance embeds several buttons (Slot5 holds three), so the UI
+        must match on the pair.
 
         `value` is the binding's "Param 0" -- the argument this button passes to
         the Verse event -- as text, or None when the event field takes none.
@@ -2673,6 +2710,8 @@ if _ready:
         pkg = _Package(_wbp_file(wbp_path))
         return [{"event": export["name"],
                  "widget": _read_slot(pkg, slots["widget"]),
+                 "button": (_read_slot(pkg, slots["button"])
+                            if "button" in slots else None),
                  "delegate": _read_slot(pkg, slots["delegate"]),
                  "field": _read_slot(pkg, slots["field"]),
                  "value": _read_param_value(pkg, slots)}
@@ -3150,7 +3189,7 @@ if _ready:
         pkg._reparse()
 
     def _pick_template(pkg, param, params):
-        """(event name, its delegate) to clone for a field taking `param`.
+        """(event name, its delegate) to clone for a FLAT field taking `param`.
 
         A clone copies its template's GRAPH, which for a parameterised binding is
         TYPED -- and the engine trusts that graph over the FName the patcher
@@ -3158,8 +3197,15 @@ if _ready:
         field back to the int one (measured). So the donor's param must MATCH, and
         a plain event is always safe: its graph carries no parameter, and _add_pin
         builds the pin the clone then lacks.
+
+        The donor must also be FLAT. A sub-widget event's EventPath has an extra
+        leading segment (the inner button), and a retarget only rewrites
+        widget/delegate/field -- so cloning one onto a flat button would leave
+        that stale segment behind and the path would not resolve. Only sub-widget
+        events exist on a widget whose buttons all live in instances, which is why
+        this is filtered rather than assumed away.
         """
-        events = _package_events(pkg)
+        events = [(e, s) for e, s in _package_events(pkg) if "button" not in s]
 
         if param:
             for export, slots in events:      # same-typed: graph already agrees
@@ -3369,10 +3415,15 @@ if _ready:
                 display = widget.get("display", meta["sub_widget"])
                 sub_seeds.append((ev_name, display, field, value))
 
-            # Only FLAT additions still need a clone template / first-event seed.
+            # Only FLAT additions still need a clone template / first-event seed,
+            # and only a FLAT existing event can serve as that template (see
+            # _pick_template) -- so a widget carrying nothing but sub-widget
+            # events still has to be seeded, or the clone below finds no donor.
             flat = [a for a in additions if _sub_meta(_event_addition(a)[0]) is None]
-            seed = (None if (sub_seeds or list_event_bindings(wbp_path))
-                    else (_seed_first_event(wbp_path) if flat else None))
+            has_flat_donor = any(e["button"] is None
+                                 for e in list_event_bindings(wbp_path))
+            seed = (_seed_first_event(wbp_path)
+                    if (flat and not has_flat_donor) else None)
             return seed, declaring, params, sub_seeds, flat
 
         def resolve_delegate(widget, delegate, declaring):
@@ -5927,7 +5978,8 @@ if _ready:
             out = []
             for row in rows:
                 parts = [row.get("display", row.get("widget", "")),
-                         _widget_class_label(row.get("native", "")),
+                         row.get("class_label")
+                         or _widget_class_label(row.get("native", "")),
                          row.get("dest", "")]
                 # Event rows have no single dest -- their pickable events are the
                 # delegate labels; make those searchable too.
@@ -5958,6 +6010,14 @@ if _ready:
                 return
 
             bound = self._bound_map()
+            # A widget that SUBCLASSES a UEFN one is in both lists at once -- its
+            # own Verse field and its inherited native property are two real,
+            # different targets on ONE widget. Label both rows with the asset name
+            # (WC_CustomQuietButton), not the native base for one and the asset for
+            # the other: the same widget listed under two class names reads as two
+            # unrelated widgets.
+            child_class = {c["name"]: _asset_object_name(c["child_wbp_path"])
+                           for c in self._child_widgets}
             rows = []
             # Engine widget properties…
             for widget in self._widgets:
@@ -5970,7 +6030,11 @@ if _ready:
                         continue
                     src, has_conv = bound.get((widget["name"], prop), (None, False))
                     rows.append({"kind": "native", "widget": widget["name"],
-                                 "native": widget["native"], "prop": prop,
+                                 "native": widget["native"],
+                                 "class_label": child_class.get(
+                                     widget["name"],
+                                     _widget_class_label(widget["native"])),
+                                 "prop": prop,
                                  "dest": prop, "bindable": direct,
                                  "src": src, "has_conv": has_conv})
             # …and sub-widget Verse fields (exact type match only), together.
@@ -5980,20 +6044,35 @@ if _ready:
                         continue
                     src, has_conv = bound.get((child["name"], cf["name"]), (None, False))
                     rows.append({"kind": "child", "widget": child["name"],
-                                 "native": child["child_wbp_path"].rsplit("/", 1)[-1],
+                                 # The asset path's tail is already "Name.Name"
+                                 # (/NewTesting/WC_Slot.WC_Slot), so splitting on
+                                 # "/" alone would display the name twice.
+                                 "native": _asset_object_name(child["child_wbp_path"]),
+                                 "class_label": child_class[child["name"]],
                                  "class_path": child["class_path"],
                                  "child_field": cf["name"], "dest": cf["name"],
                                  "bindable": True, "src": src, "has_conv": has_conv})
+
+            # Keep one widget's targets together. The two loops above append by
+            # SOURCE (natives, then children), which splits a subclassed widget's
+            # two rows to opposite ends of the table. Stable sort on the widget
+            # name alone, so each widget's own order (properties, then fields) and
+            # the discovery order of the rest are both preserved.
+            rows.sort(key=lambda r: r["widget"])
 
             rows = self._filter_target_rows(rows)
             self._target_rows = rows
             self.tbl_targets.setRowCount(len(rows))
             for r, row in enumerate(rows):
                 self.tbl_targets.setItem(r, 0, QTableWidgetItem(row["widget"]))
-                # CLASS is cosmetic — show "UEFN Button", not FortCTAButton. The row's
-                # own `native` stays the real class; the binding resolves through it.
-                self.tbl_targets.setItem(
-                    r, 1, QTableWidgetItem(_widget_class_label(row["native"])))
+                # CLASS is cosmetic — show "UEFN Button", not FortCTAButton, and
+                # the ASSET name for a widget that carries Verse fields so its two
+                # rows agree. The row's own `native` stays the real class; the
+                # binding resolves through it.
+                cls_item = QTableWidgetItem(
+                    row.get("class_label") or _widget_class_label(row["native"]))
+                cls_item.setToolTip(row["native"])
+                self.tbl_targets.setItem(r, 1, cls_item)
                 prop_item = QTableWidgetItem(row["dest"])
                 if not row["bindable"]:
                     prop_item.setForeground(QColor(C_TX2))
@@ -6119,22 +6198,31 @@ if _ready:
                 self._log("Could not read event bindings: %s" % exc, C_ERR)
                 return
 
-            # (widget, delegate) -> LIST of events: one delegate may drive
-            # several Verse fields; keying one-to-one would hide all but the last.
+            # (widget, button, delegate) -> LIST of events: one delegate may
+            # drive several Verse fields; keying one-to-one would hide all but
+            # the last. `button` is in the key because ONE sub-widget instance
+            # can embed several buttons (Slot5 holds three, all declaring
+            # OnButtonBaseClicked) -- keying on the instance alone would light
+            # up all three rows for a binding that belongs to just one.
             bound = {}
             for ev in events:
-                bound.setdefault((ev["widget"], ev["delegate"]), []).append(ev)
+                bound.setdefault(
+                    (ev["widget"], ev["button"], ev["delegate"]), []).append(ev)
 
             # ONE row per widget, the event picked in the row (a row per
             # widget x delegate is unusable: 4 buttons x 7 events = 28 rows).
             rows = []
             for w in self._event_widgets:
+                # A sub-widget row's own button; None on a flat one, which is
+                # exactly what a flat event reads back as.
+                button = w.get("button_var")
                 mine = [d for d, _l in w["delegates"]
                         if any(e["field"] == field["name"]
-                               for e in bound.get((w["name"], d), ()))]
+                               for e in bound.get((w["name"], button, d), ()))]
                 # Land on the event this field is already bound to, else On Clicked.
                 current = mine[0] if mine else w["delegates"][0][0]
                 rows.append({"kind": "event", "widget": w["name"],
+                             "button": button,
                              "display": w.get("display", w["name"]),
                              "native": w["native"],
                              "label": w.get("label", w["native"]),
@@ -6199,7 +6287,8 @@ if _ready:
             A delegate can drive several fields, so list them all -- showing only one
             would make the others invisible and look like binding had replaced them.
             """
-            evs = row["bound"].get((row["widget"], row["delegate"]), [])
+            evs = row["bound"].get(
+                (row["widget"], row.get("button"), row["delegate"]), [])
             others = [e["field"] for e in evs if e["field"] != field["name"]]
             mine = next((e for e in evs if e["field"] == field["name"]), None)
             has_mine = mine is not None
@@ -6251,7 +6340,8 @@ if _ready:
                 # already-bound row would lock the button to its first field.
                 fresh = []
                 for t in targets:
-                    evs = t["bound"].get((t["widget"], t["delegate"]), [])
+                    evs = t["bound"].get(
+                        (t["widget"], t.get("button"), t["delegate"]), [])
                     if any(e["field"] == field["name"] for e in evs):
                         continue          # this exact binding already exists
                     fresh.append(t)
@@ -6346,7 +6436,8 @@ if _ready:
                 field = self._selected_field()
                 doomed = []
                 for t in targets:
-                    for ev in t["bound"].get((t["widget"], t["delegate"]), []):
+                    for ev in t["bound"].get(
+                            (t["widget"], t.get("button"), t["delegate"]), []):
                         # A delegate may drive several fields; drop only this one's.
                         if not field or ev["field"] == field["name"]:
                             doomed.append(ev["event"])

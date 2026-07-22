@@ -1094,6 +1094,37 @@ Brush conversion node lives **inside the child widget** (the child binds its own
 `VF_SlotImage` → its `Image.Brush`). The parent→child hop is same-type property-to-property,
 so it is fully Python-scriptable — none of the un-scriptable Brush-node machinery is involved.
 
+#### A SUBCLASSED UEFN widget is both native-derived *and* a Verse-field carrier
+
+Discovering child widgets by "is a `_C` class **and** has no native base" is **wrong**, and the
+failure is silent. A widget that subclasses a UEFN one — e.g. `WC_CustomQuietButton`, a
+Blueprint subclass of the Quiet Button, deriving `FortCTAButton` — satisfies *both* halves:
+
+* it is native-derived, so a native-base test excludes it from **child** discovery, hiding its own
+  Verse fields (`VF_Text`) entirely; and
+* it is a user widget, so the property lister claims it and offers only the **inherited** `Text`.
+
+Net effect: the only bindable target offered is `Text`, its Verse field is unreachable, and an
+*existing* editor-made binding to that field reads back as unbound. Decide membership on **"does its
+own WBP declare Verse fields?"** alone. Such a widget legitimately appears in **both** lists — the
+two describe different destinations on the same instance (its Verse field vs. its native property),
+and both are valid bindings.
+
+An asset path's tail is already `Name.Name`, so deriving a display name with `rsplit("/")[-1]`
+prints it twice (`WC_SlotWidget.WC_SlotWidget`); split on `.` as well.
+
+Because such a widget yields rows from **two** sources, presentation needs care or it reads as two
+unrelated widgets: label both rows with the **asset** name (the native-base label would call the
+subclass "UEFN Button", indistinguishable from a stock one) and **group rows by widget**, since
+appending natives-then-children puts one widget's two rows at opposite ends of the table.
+
+**Nested-into-a-widget destinations work too** (parent field → a widget *inside* a child instance,
+e.g. `Slot1`'s inner `UEFN_TextBlock_C_73.Text`): the `DestinationPath` takes the same **two-segment**
+shape as a sub-widget *event* — segment 1 the inner widget on the child's generated class **with its
+`VarGuid`**, segment 2 the property on its declaring class. Editor-verified: `import_text` normalizes
+the second segment's `MemberParent` to the wrapped form, the blueprint compiles `BS_UP_TO_DATE`, and
+a zeroed source `MemberGuid` comes back resolved.
+
 ### Cloning an existing binding across N instances — the reliable pattern
 
 When one instance is already wired in the editor UI (e.g. `Slot1`), replicate it to the
@@ -1587,9 +1618,34 @@ param pin) on disk exactly as for a flat event. Discover candidates (with their 
 via `list_sub_widget_event_buttons(path)`.
 
 Parameterised events work unchanged (the Param 0 value rides in `SavedPins` as always; verified
-sticking on a sub-widget button). When a sub-widget holds **more than one button**, the instance
-name alone is ambiguous — disambiguate by the button's **class** (both buttons of a slot share the
-instance name but differ in class).
+sticking on a sub-widget button).
+
+#### Reading one back: the delegate is NOT `MemberName[0]`
+
+How many `MemberName` entries an event export carries depends on the button, and the **Verse field
+is always last**:
+
+| button | `MemberName` entries | count |
+|---|---|---|
+| flat | `delegate`, `field` | 2 |
+| sub-widget | **`button_var`**, `delegate`, `field` | 3 |
+
+So the delegate is **`members[-2]`**, never `members[0]`. Reading slot 0 as the delegate yields the
+inner button's *variable name* (`CustomButtonQuiet`) on every sub-widget event — which silently
+breaks read-back (the UI matches on `(widget, delegate)`, finds nothing, and shows the binding as
+unbound even though it was created correctly) and **corrupts a retarget**, which would write the
+delegate name over the button segment. `MemberParent` is written once per segment too, so pair it
+with the delegate positionally, not at index 0.
+
+When a sub-widget holds **more than one button**, the instance name alone is ambiguous — and so is
+the class (a slot can hold two buttons of the *same* class). Key on the **button variable name**
+(`(WidgetName, button_var, delegate)`); that is the only part guaranteed unique within an instance.
+Keying on the instance alone makes one button's binding light up all of its siblings' rows and makes
+an unbind remove their events too.
+
+A clone template must also match the donor's **shape**: a flat button cannot clone a sub-widget event
+(a retarget only rewrites widget/delegate/field, leaving the extra segment stale), so a widget whose
+only events are sub-widget ones still needs a fresh seed.
 
 ---
 

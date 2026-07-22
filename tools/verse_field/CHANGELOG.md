@@ -5,6 +5,15 @@ is per-tool: this file and `VERSION.txt` live alongside the tool and track only
 it. The in-tool **Check for updates** button shows this file so you can see what
 a release changes before installing anything.
 
+## v1.2.1
+
+- **Verse fields on subclassed widgets are bindable again** — a custom button
+  offered only its inherited `Text`.
+- **Sub-widget button events now show as bound**, on the right button when a slot
+  holds several. Unbinding no longer hits the others.
+- Tidier target list: rows grouped by widget, one class name each, no doubled
+  names.
+
 ## v1.2
 
 - **Batch rename fields** in Manage Fields — Find & Replace, Prefix/Suffix, or
