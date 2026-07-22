@@ -1170,8 +1170,17 @@ intermediate *widget*, so a first-segment parse reports `Slot1`'s binding as tar
 `CustomButtonQuiet` and silently corrupts occupancy and unbind. Occupancy must key on
 `(widget, hops, prop)`: two bindings can share `(widget, prop)` and target different widgets.
 
-The blocker is **discovery, not the binding** — enumerating what is nested where needs a widget-tree
-walk, which the T3D export rule above forbids. See that warning for the two viable routes.
+**Discovery is solved by reading the saved `.uasset`.** A widget tree is recoverable without any
+export: each export entry's `ClassIndex` (at `entry+0`) is negative for an imported class, and
+`-(N+1)` indexes the import table whose ObjectName is the class — giving the same `(class, name)`
+pairs a T3D export yields. The import table also carries full package paths
+(`/Game/Valkyrie/UMG/UEFN_TextBlock`), which is how a generated class resolves to its asset; the
+asset-registry name search does **not** find engine content like `UEFN_TextBlock`, so prefer the
+import paths and fall back to the registry. Per-asset `VarGuid` lookups are still safe via a single
+export of that one asset — just never while iterating another's results.
+
+`list_deep_targets()` implements this: the nested walk that crashed three times now runs entirely
+off disk (~0.1s for a 5-slot tree) and cannot take the editor down.
 
 ### Cloning an existing binding across N instances — the reliable pattern
 

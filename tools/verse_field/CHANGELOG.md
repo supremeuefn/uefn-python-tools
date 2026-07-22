@@ -5,6 +5,11 @@ is per-tool: this file and `VERSION.txt` live alongside the tool and track only
 it. The in-tool **Check for updates** button shows this file so you can see what
 a release changes before installing anything.
 
+## v1.3
+
+- **Bind widgets nested deeper than one level**, e.g. `Slot1 > Button > Text`,
+  in a single binding — no more bridging a field through every level.
+
 ## v1.2.1
 
 - **Verse fields on subclassed widgets are bindable again** — a custom button
