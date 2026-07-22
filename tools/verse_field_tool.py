@@ -33,7 +33,7 @@ HARD-WON DETAILS (each cost a crash or a corrupt asset)
 
 import sys
 
-__version__ = "1.2"
+__version__ = "1.2.1"
 
 # Auto-update source. This repo hosts SEVERAL tools, so versioning is PER-TOOL,
 # not repo-wide: each tool keeps its own VERSION.txt + CHANGELOG.md in its own
