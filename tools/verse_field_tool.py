@@ -1341,6 +1341,13 @@ if _ready:
 
         One export feeds both list_widgets and list_child_widgets — pass the
         result to each so a Load only exports once.
+
+        NEVER call this for asset B while iterating the entries this returned for
+        asset A: the export invalidates the pointers behind the entries already
+        being looped over and takes the editor down instantly. Collect the assets
+        to read first, export each to completion, then traverse the results. See
+        "NEVER export a T3D while iterating another export's results" in the
+        skill reference — it cost three editor crashes to isolate.
         """
         wbp = _el.load_asset(wbp_path)
         text = _export_t3d(wbp)
@@ -1645,20 +1652,51 @@ if _ready:
 
     _SRC_RE = r'SourcePath=\(Paths=\(\(BindingReference=\(MemberName="([^"]+)"'
     _DST_WIDGET_RE = r'DestinationPath=.*?WidgetName="([^"]*)"'
-    _DST_PROP_RE = (r'DestinationPath=\(Paths=\(\(BindingReference=\('
-                    r'(?:MemberParent="[^"]*",)?MemberName="([^"]+)"')
+    _DST_MEMBER_RE = r'MemberName="([^"]+)"'
+
+    def _destination_body(binding_text):
+        """Just the DestinationPath's Paths(...) body, or "" if absent."""
+        _, _, rest = binding_text.partition("DestinationPath=")
+        return rest.partition(",BindingType=")[0] if rest else ""
+
+    def _destination_segments(binding_text):
+        """Every MemberName in the DestinationPath, outermost first.
+
+        A destination is a Paths ARRAY, not a single reference:
+          1 segment   Slot1.VF_SlotName            (widget's own field/property)
+          2 segments  Slot1 > CustomButtonQuiet.VF_Text
+          n segments  one hop per nested widget, the LAST being the property.
+        """
+        return re.findall(_DST_MEMBER_RE, _destination_body(binding_text))
 
     def _destination_of(binding_text):
+        """(widget, property) a binding writes -- the property is the LAST segment.
+
+        Taking the FIRST segment names the intermediate WIDGET on a nested
+        destination (reporting Slot1's binding as targeting "CustomButtonQuiet"),
+        which silently corrupts occupancy and unbind alike. The nested hops are
+        available separately via _destination_path.
+        """
         widget = re.search(_DST_WIDGET_RE, binding_text)
-        prop = re.search(_DST_PROP_RE, binding_text)
-        if widget and prop:
+        members = _destination_segments(binding_text)
+        if widget and members:
             # Normalize the serialized name (bIsEnabled) back to the friendly one
             # (IsEnabled) so display, occupancy and unbind all speak one language.
-            return widget.group(1), _friendly_prop(prop.group(1))
+            return widget.group(1), _friendly_prop(members[-1])
         return None
 
+    def _destination_path(binding_text):
+        """The nested widget hops between WidgetName and the property ([] if flat)."""
+        return _destination_segments(binding_text)[:-1]
+
     def existing_bindings(wbp_path):
-        """[{index, source, widget, prop, has_conversion}] for the current view."""
+        """[{index, source, widget, path, prop, has_conversion}] for the current view.
+
+        `path` is the tuple of nested widget hops under `widget` -- () for a flat
+        destination, ("CustomButtonQuiet",) for one nested level. Two bindings can
+        share (widget, prop) yet target different widgets, so occupancy keys on
+        (widget, path, prop).
+        """
         wbp = _el.load_asset(wbp_path)
         subsystem = unreal.get_editor_subsystem(unreal.MVVMEditorSubsystem)
         # get_view() reads; request_view() would CREATE a view (a mutation).
@@ -1676,6 +1714,7 @@ if _ready:
                 # source lives on a pin inside the generated conversion graph.
                 "source": src.group(1) if src else None,
                 "widget": dest[0] if dest else "?",
+                "path": tuple(_destination_path(text)) if dest else (),
                 "prop": dest[1] if dest else "?",
                 "has_conversion": "MVVMBlueprintViewConversionFunction" in text,
             })

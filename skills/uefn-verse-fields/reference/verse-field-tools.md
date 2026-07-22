@@ -1118,12 +1118,60 @@ unrelated widgets: label both rows with the **asset** name (the native-base labe
 subclass "UEFN Button", indistinguishable from a stock one) and **group rows by widget**, since
 appending natives-then-children puts one widget's two rows at opposite ends of the table.
 
+#### ⚠ NEVER export a T3D while iterating another export's results — instant editor death
+
+`_export_t3d` (an `AssetExportTask`) **invalidates the pointers behind entries you are already
+looping over**. Exporting asset B in the middle of a `for` over asset A's entries kills the editor
+with a dropped connection — reproduced three times, and isolated to exactly this shape:
+
+| what | result |
+|---|---|
+| export child asset, alone | fine |
+| export grandchild asset, alone | fine |
+| export grandchild **inside a loop over the child's entries** | **crash** |
+
+It is NOT export volume, NOT the shared `verse_binder_scan.t3d` scratch path, and NOT touching
+assets the editor doesn't have open — all three were tested and cleared. Caching the exports and
+capping a work budget does **not** help, because a single nested export is enough.
+
+`list_sub_widget_event_buttons` looks like a counter-example but isn't: it exports the child and
+then loops over *that child's own* entries — it never re-enters an export mid-iteration of a
+different pending walk.
+
+**Consequence for multi-level discovery:** you cannot walk a widget tree deeper than one level with
+T3D exports at all. Collect every asset you intend to read FIRST, export them one at a time to
+completion, and only then traverse the collected results — or read the saved `.uasset` files
+directly (`_Package` already parses them) and keep the editor out of it entirely.
+
 **Nested-into-a-widget destinations work too** (parent field → a widget *inside* a child instance,
 e.g. `Slot1`'s inner `UEFN_TextBlock_C_73.Text`): the `DestinationPath` takes the same **two-segment**
 shape as a sub-widget *event* — segment 1 the inner widget on the child's generated class **with its
 `VarGuid`**, segment 2 the property on its declaring class. Editor-verified: `import_text` normalizes
 the second segment's `MemberParent` to the wrapped form, the blueprint compiles `BS_UP_TO_DATE`, and
 a zeroed source `MemberGuid` comes back resolved.
+
+**And the depth is not capped at two.** `DestinationPath.Paths` is a plain array, so one binding can
+reach a leaf ANY number of levels down — no bridge field on each intermediate widget. Verified to
+three segments (`Slot1 > CustomButtonQuiet > UEFN_TextBlock_C_35.Text`, `BS_UP_TO_DATE`).
+
+The proof that the engine really *walks* the chain rather than storing it verbatim is a controlled
+pair, worth repeating whenever this is revisited:
+
+| destination | compile | leaf `MemberGuid` |
+|---|---|---|
+| real leaf (`VF_Text`) | `BS_UP_TO_DATE` | **stamped by the compiler** (matches the leaf's `VarGuid`) |
+| bogus leaf (`VF_DoesNotExist`) | **`BS_ERROR`** | absent |
+
+Rules: every hop **except the last** must carry that widget's `VarGuid` (a zeroed one there does not
+resolve); the leaf's may be omitted and the compiler fills it in.
+
+Reading one back, the property is the **LAST** segment — `MemberName[0]` is the outermost
+intermediate *widget*, so a first-segment parse reports `Slot1`'s binding as targeting
+`CustomButtonQuiet` and silently corrupts occupancy and unbind. Occupancy must key on
+`(widget, hops, prop)`: two bindings can share `(widget, prop)` and target different widgets.
+
+The blocker is **discovery, not the binding** — enumerating what is nested where needs a widget-tree
+walk, which the T3D export rule above forbids. See that warning for the two viable routes.
 
 ### Cloning an existing binding across N instances — the reliable pattern
 
