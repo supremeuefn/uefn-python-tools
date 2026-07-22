@@ -1478,6 +1478,158 @@ if _ready:
         _child_fields_cache[child_wbp_path] = fields
         return fields
 
+    # ── reading a widget tree WITHOUT a T3D export ───────────────────────────
+    # A T3D export invalidates the entries of any export already being iterated,
+    # so a nested walk is fatal (see the skill reference: it cost three editor
+    # crashes). The saved .uasset carries the same structure, and _Package
+    # already parses it -- so nesting is discovered from DISK and the editor is
+    # never asked to export anything.
+
+    _disk_tree_cache = {}
+    _disk_class_assets = {}      # generated class name -> owning asset path
+
+    def _disk_widget_tree(wbp_path):
+        """[(class_name, object_name)] for an asset's widgets, read from disk.
+
+        The export table's ClassIndex (entry+0) is negative for an imported
+        class: -(N+1) indexes the import table, whose ObjectName is the class.
+        That is the same (class, name) pairing _widget_tree_entries derives from
+        a T3D export, minus the export.
+        """
+        if wbp_path in _disk_tree_cache:
+            return _disk_tree_cache[wbp_path]
+        pairs = []
+        try:
+            pkg = _Package(_wbp_file(wbp_path))
+            imports = []
+            for i in range(pkg.import_count):
+                index, number = struct.unpack_from(
+                    "<ii", pkg.data,
+                    pkg.import_offset + i * _IMPORT_ENTRY_SIZE + _IMPORT_NAME_FIELD)
+                imports.append(pkg.fname(index, number))
+            # Package paths are imports too (/Game/Valkyrie/UMG/UEFN_TextBlock),
+            # and they are how a generated class resolves to its ASSET. The
+            # asset registry cannot be relied on here: engine-content widgets
+            # like UEFN_TextBlock do not come back from a bare-name search.
+            for text in imports:
+                if text and text.startswith("/") and "/" in text[1:]:
+                    _disk_class_assets.setdefault(
+                        "%s_C" % text.rsplit("/", 1)[-1], "%s.%s" % (
+                            text, text.rsplit("/", 1)[-1]))
+            seen = set()
+            for export in pkg.exports:
+                class_index = struct.unpack_from("<i", pkg.data, export["entry"])[0]
+                if class_index >= 0:            # class is itself an export: not a widget
+                    continue
+                cls = imports[-class_index - 1]
+                key = (cls, export["name"])
+                if cls and key not in seen:
+                    seen.add(key)
+                    pairs.append(key)
+        except Exception:
+            pairs = []
+        _disk_tree_cache[wbp_path] = pairs
+        return pairs
+
+    def _class_asset(class_name, seen_in=None):
+        """Generated class name ("UEFN_TextBlock_C") -> its asset path.
+
+        Prefers the package paths harvested from an import table (which cover
+        engine content the asset-registry name search misses, e.g. everything
+        under /Game/Valkyrie/UMG), falling back to the registry.
+        """
+        if not class_name.endswith("_C"):
+            return None
+        if seen_in:
+            _disk_widget_tree(seen_in)        # populates _disk_class_assets
+        return _disk_class_assets.get(class_name) or _resolve_widget_name(
+            class_name[:-2])
+
+    def _disk_child_instances(wbp_path):
+        """[(instance_name, child_wbp_path)] for embedded user widgets, from disk."""
+        out = []
+        for cls, name in _disk_widget_tree(wbp_path):
+            child = _class_asset(cls, wbp_path)
+            if child and child != wbp_path:
+                out.append((name, child))
+        return out
+
+    # Levels BELOW the top-level instance. 1 => "Slot1 > Button.Prop" (2 path
+    # segments). Verified working to 2 (3 segments); the format has no cap, but
+    # each extra level multiplies rows and the editor's own panel stops at one.
+    _MAX_NEST_DEPTH = 2
+
+    def _disk_widget_guids(wbp_path):
+        """{widget name -> VarGuid} for an asset, via ONE export of that asset.
+
+        _child_widget_var_guids exports a single asset and returns immediately --
+        it never holds another export's entries open, which is the pattern that
+        crashes. Safe to call once per asset in sequence; NOT safe to call while
+        iterating a T3D export's results.
+        """
+        return _child_widget_var_guids(wbp_path)
+
+    def list_deep_targets(wbp_path):
+        """Bindable targets nested MORE than one level under `wbp_path`.
+
+        [{widget, hops, path, kind, native, prop, type}] -- `widget` is the
+        top-level instance (the binding's WidgetName), `hops` the intermediate
+        widget names below it, `prop` the leaf. One-level targets are excluded:
+        list_widgets / list_child_widgets already cover those.
+
+        Structure comes from the saved .uasset (_disk_widget_tree), never from a
+        T3D export, so the nested walk this needs cannot crash the editor.
+        """
+        rows = []
+
+        def walk(asset, hops, depth):
+            if depth > _MAX_NEST_DEPTH:
+                return
+            guids = _disk_widget_guids(asset)
+            for cls, name in _disk_widget_tree(asset):
+                guid = guids.get(name)
+                if not guid:
+                    continue          # no VarGuid -> not addressable as a segment
+                child = _class_asset(cls, asset)
+                chain = hops + [{"name": name, "guid": guid,
+                                 "parent_class": _wrap_generated_class(
+                                     _generated_class_of(asset))}]
+                # A leaf: this widget's own native properties…
+                base = _native_base_of_class(cls, asset)
+                for prop in (widget_bindable_properties(base) if base else ()):
+                    rows.append({"widget": top, "hops": [h["name"] for h in chain],
+                                 "path": chain, "kind": "native", "native": base,
+                                 "prop": prop, "type": None})
+                if not child:
+                    continue
+                # …its own Verse fields…
+                for f in _child_verse_fields(child):
+                    rows.append({"widget": top, "hops": [h["name"] for h in chain],
+                                 "path": chain, "kind": "field",
+                                 "native": _asset_object_name(child),
+                                 # A Verse-field leaf names the OWNING child's
+                                 # generated class as its MemberParent.
+                                 "leaf_class": _wrap_generated_class(
+                                     _generated_class_of(child)),
+                                 "prop": f["name"], "type": f["type"]})
+                # …and deeper.
+                walk(child, chain, depth + 1)
+
+        for top, child in _disk_child_instances(wbp_path):
+            walk(child, [], 1)
+        return rows
+
+    def _generated_class_of(wbp_path):
+        """Asset path -> its generated class path (/N/WC_Slot.WC_Slot_C)."""
+        return "%s_C" % wbp_path
+
+    def _native_base_of_class(class_name, seen_in=None):
+        """Bare class NAME (from the disk tree) -> its native base, or None."""
+        if getattr(unreal, class_name, None) is not None:
+            return class_name
+        asset = _class_asset(class_name, seen_in)
+        return _native_base("%s_C" % asset) if asset else None
+
     def list_child_widgets(wbp_path, entries=None):
         """Embedded USER-widget instances that expose Verse fields.
 
@@ -1650,6 +1802,36 @@ if _ready:
             _wrap_generated_class(child_class_path), child_field)
         return _binding_from_parts(field_name, _ZERO_GUID, widget_name, dest_ref, binding_id)
 
+    def _binding_string_deep(field_name, widget_name, hops, leaf_ref, binding_id):
+        """Parent field -> a target nested SEVERAL levels down, in ONE binding.
+
+        `hops` are the intermediate widgets ({name, guid, parent_class}), each
+        becoming its own path segment BEFORE the leaf; `leaf_ref` is the final
+        BindingReference body (a property or the child's Verse field).
+
+        Every hop MUST carry its VarGuid -- a zeroed one there does not resolve
+        (unlike the leaf's, which the compiler fills in). Editor-verified: the
+        blueprint compiles BS_UP_TO_DATE and the compiler stamps the leaf GUID,
+        while a bogus leaf fails with BS_ERROR -- proof the chain is walked.
+        """
+        segments = ['(BindingReference=(MemberParent="%s",MemberName="%s",'
+                    'MemberGuid=%s),BindingKind=Property)'
+                    % (h["parent_class"], h["name"], h["guid"]) for h in hops]
+        segments.append('(BindingReference=(%s),BindingKind=Property)' % leaf_ref)
+        return (
+            '(SourcePath=(Paths=((BindingReference=(MemberName="%s",MemberGuid=%s,'
+            'bSelfContext=True),BindingKind=Property)),WidgetName="",'
+            'ContextId=00000000000000000000000000000000,Source=SelfContext,'
+            'bIsComponent=False,bDeprecatedSource=True),'
+            'DestinationPath=(Paths=(%s),'
+            'WidgetName="%s",ContextId=00000000000000000000000000000000,Source=Widget,'
+            'bIsComponent=False,bDeprecatedSource=True),'
+            'BindingType=OneWayToDestination,bOverrideExecutionMode=False,'
+            'OverrideExecutionMode=Immediate,'
+            'Conversion=(DestinationToSourceConversion=None,SourceToDestinationConversion=None),'
+            'BindingId=%s,bEnabled=True,bCompile=True)'
+            % (field_name, _ZERO_GUID, ",".join(segments), widget_name, binding_id))
+
     _SRC_RE = r'SourcePath=\(Paths=\(\(BindingReference=\(MemberName="([^"]+)"'
     _DST_WIDGET_RE = r'DestinationPath=.*?WidgetName="([^"]*)"'
     _DST_MEMBER_RE = r'MemberName="([^"]+)"'
@@ -1732,13 +1914,28 @@ if _ready:
         if isinstance(pair, dict):
             p = dict(pair)
             p.setdefault("mode", "child")
-            p["dest"] = p["child_field"]
+            # A DEEP pair carries the nested hops; its destination is the leaf.
+            p["dest"] = p.get("child_field") or p["prop"]
             return p
         field, widget, native, prop = pair
         return {"mode": "native", "field": field, "widget": widget,
                 "native": native, "prop": prop, "dest": prop}
 
     def _pair_binding_string(p, guid, binding_id):
+        if p["mode"] == "deep":
+            # The leaf is either a nested widget's PROPERTY or its Verse FIELD.
+            if p.get("kind") == "field":
+                leaf = 'MemberParent="%s",MemberName="%s"' % (
+                    p["leaf_class"], p["prop"])
+            else:
+                declaring = _declaring_class(p["native"], p["prop"])
+                member = _serialized_prop(p["prop"])
+                leaf = ('MemberName="%s",bSelfContext=True' % member
+                        if declaring is None else
+                        'MemberParent="%s",MemberName="%s"'
+                        % (_class_path(declaring), member))
+            return _binding_string_deep(p["field"], p["widget"], p["hops"],
+                                        leaf, binding_id)
         if p["mode"] == "child":
             return _binding_string_child(p["field"], p["widget"],
                                          p["class_path"], p["child_field"], binding_id)
@@ -1817,10 +2014,15 @@ if _ready:
 
             # _destination_of normalizes bIsEnabled -> IsEnabled, so this matches
             # the tool's own IsEnabled binding on reload (no duplicate).
+            # The HOPS are part of the identity: "Slot1 > Button.Text" and a flat
+            # "Slot1.Text" share (widget, prop) but are different destinations,
+            # and treating them as one would clobber the wrong binding.
+            want_hops = [h["name"] for h in p.get("hops", ())]
             bindings = list(view.get_editor_property("bindings"))
             occupied = next(
                 (i for i, b in enumerate(bindings)
-                 if _destination_of(b.export_text()) == (p["widget"], p["dest"])), None)
+                 if _destination_of(b.export_text()) == (p["widget"], p["dest"])
+                 and _destination_path(b.export_text()) == want_hops), None)
 
             if occupied is not None and not replace:
                 result["skipped"].append((tag, "destination already bound"))
@@ -1853,7 +2055,11 @@ if _ready:
 
     @_keeps_editor_open
     def remove_bindings(wbp_path, destinations):
-        """Delete bindings by [(widget, prop)].
+        """Delete bindings by [(widget, prop)] or [(widget, hops, prop)].
+
+        The 3-tuple form distinguishes a NESTED destination from a flat one on
+        the same widget+property ("Slot1 > Button.Text" vs "Slot1.Text"); the
+        2-tuple form means "flat" and is kept so existing callers still work.
 
         remove_binding() silently no-ops on a struct pulled from the array (a copy).
         Rebuilding the array is the only reliable delete.
@@ -1863,10 +2069,13 @@ if _ready:
         view = subsystem.get_view(wbp)
         if view is None:
             return 0
-        targets = set(destinations)
+        targets = {d if len(d) == 3 else (d[0], (), d[1]) for d in destinations}
         keep, dropped = [], 0
         for binding in view.get_editor_property("bindings"):
-            if _destination_of(binding.export_text()) in targets:
+            text = binding.export_text()
+            dest = _destination_of(text)
+            key = (dest[0], tuple(_destination_path(text)), dest[1]) if dest else None
+            if key in targets:
                 dropped += 1
                 continue
             keep.append(binding)
@@ -4484,6 +4693,7 @@ if _ready:
             self._manage_rows = []      # _fields after the Manage tab's sort
             self._widgets = []
             self._child_widgets = []
+            self._deep_targets = []
             self._event_widgets = []    # only widgets that declare event delegates
             self._target_rows = []
             self._pending_pairs = []
@@ -5884,6 +6094,7 @@ if _ready:
             # widget); the cache is only valid within a single load.
             _child_fields_cache.clear()
             _child_button_guids_cache.clear()
+            _disk_tree_cache.clear()
             try:
                 fields = list_verse_fields(path)
                 entries = _widget_tree_entries(path)   # one T3D export for all three
@@ -5896,8 +6107,17 @@ if _ready:
             except Exception as exc:
                 self._log("Load failed: %s" % exc, C_ERR)
                 return
+            # Deep targets AFTER the export-based lists are finished with
+            # `entries` -- it reads the saved .uasset rather than exporting, and
+            # must never run while a T3D export's results are still being walked.
+            try:
+                deep = list_deep_targets(path)
+            except Exception as exc:
+                deep = []
+                self._log("Nested targets unavailable: %s" % exc, C_WARN)
             self._wbp_path, self._fields = path, fields
             self._widgets, self._child_widgets = widgets, children
+            self._deep_targets = deep
             self._event_widgets = event_widgets
             # Show just the widget name now that the full path is remembered.
             self.path_edit.setText(self._widget_name(path))
@@ -5918,7 +6138,14 @@ if _ready:
             self._fill_category_combo(self.create_category)
 
         def _bound_map(self):
-            return {(b["widget"], b["prop"]): (b["source"], b["has_conversion"])
+            """Occupancy, keyed by (widget, hops, prop).
+
+            The hops belong in the key: "Slot1 > Button.Text" and a flat
+            "Slot1.Text" are different destinations that share (widget, prop).
+            Flat rows look themselves up with an empty hop tuple.
+            """
+            return {(b["widget"], b["path"], b["prop"]):
+                    (b["source"], b["has_conversion"])
                     for b in existing_bindings(self._wbp_path)}
 
         def _refresh_category_filter(self):
@@ -6067,7 +6294,7 @@ if _ready:
                     needs_conv = field["type"] in _CONVERSION_PROPS.get(prop, ())
                     if not direct and not needs_conv:
                         continue
-                    src, has_conv = bound.get((widget["name"], prop), (None, False))
+                    src, has_conv = bound.get((widget["name"], (), prop), (None, False))
                     rows.append({"kind": "native", "widget": widget["name"],
                                  "native": widget["native"],
                                  "class_label": child_class.get(
@@ -6081,7 +6308,7 @@ if _ready:
                 for cf in child["fields"]:
                     if cf["type"] != field["type"]:
                         continue
-                    src, has_conv = bound.get((child["name"], cf["name"]), (None, False))
+                    src, has_conv = bound.get((child["name"], (), cf["name"]), (None, False))
                     rows.append({"kind": "child", "widget": child["name"],
                                  # The asset path's tail is already "Name.Name"
                                  # (/NewTesting/WC_Slot.WC_Slot), so splitting on
@@ -6092,18 +6319,48 @@ if _ready:
                                  "child_field": cf["name"], "dest": cf["name"],
                                  "bindable": True, "src": src, "has_conv": has_conv})
 
-            # Keep one widget's targets together. The two loops above append by
-            # SOURCE (natives, then children), which splits a subclassed widget's
-            # two rows to opposite ends of the table. Stable sort on the widget
-            # name alone, so each widget's own order (properties, then fields) and
-            # the discovery order of the rest are both preserved.
+            # …and targets nested DEEPER than one level, reached in a single
+            # binding (no bridge field on each intermediate widget).
+            for d in self._deep_targets:
+                if d["kind"] == "field":
+                    if d["type"] != field["type"]:
+                        continue
+                    direct, needs_conv = True, False
+                else:
+                    direct = is_direct_bindable(field["type"], d["native"], d["prop"])
+                    needs_conv = field["type"] in _CONVERSION_PROPS.get(d["prop"], ())
+                    if not direct and not needs_conv:
+                        continue
+                hops = tuple(d["hops"])
+                src, has_conv = bound.get((d["widget"], hops, d["prop"]), (None, False))
+                rows.append({"kind": "deep", "widget": d["widget"],
+                             "hops": d["path"], "hop_names": d["hops"],
+                             "display": "%s > %s" % (d["widget"], " > ".join(d["hops"])),
+                             "native": d["native"],
+                             "class_label": _widget_class_label(d["native"]),
+                             "leaf_class": d.get("leaf_class"),
+                             "deep_kind": d["kind"], "prop": d["prop"],
+                             "dest": d["prop"], "bindable": direct,
+                             "src": src, "has_conv": has_conv})
+
+            # Keep one widget's targets together. The loops above append by
+            # SOURCE (natives, then children, then nested), which splits a
+            # subclassed widget's rows to opposite ends of the table. Stable sort
+            # on the widget name alone, so each widget's own order (properties,
+            # then fields, then anything nested under it) and the discovery order
+            # of the rest are both preserved.
             rows.sort(key=lambda r: r["widget"])
 
             rows = self._filter_target_rows(rows)
             self._target_rows = rows
             self.tbl_targets.setRowCount(len(rows))
             for r, row in enumerate(rows):
-                self.tbl_targets.setItem(r, 0, QTableWidgetItem(row["widget"]))
+                # A nested row shows its whole path (Slot1 > Button), since the
+                # instance name alone would be indistinguishable from a flat row
+                # on that same instance.
+                w_item = QTableWidgetItem(row.get("display", row["widget"]))
+                w_item.setToolTip(row["widget"])
+                self.tbl_targets.setItem(r, 0, w_item)
                 # CLASS is cosmetic — show "UEFN Button", not FortCTAButton, and
                 # the ASSET name for a widget that carries Verse fields so its two
                 # rows agree. The row's own `native` stays the real class; the
@@ -6363,6 +6620,11 @@ if _ready:
             if row["kind"] == "child":
                 return {"mode": "child", "field": field_name, "widget": row["widget"],
                         "class_path": row["class_path"], "child_field": row["child_field"]}
+            if row["kind"] == "deep":
+                return {"mode": "deep", "field": field_name, "widget": row["widget"],
+                        "hops": row["hops"], "kind": row["deep_kind"],
+                        "native": row["native"], "leaf_class": row["leaf_class"],
+                        "prop": row["prop"]}
             return (field_name, row["widget"], row["native"], row["prop"])
 
         # ── actions ─────────────────────────────────────────────────────────
@@ -6492,7 +6754,8 @@ if _ready:
                 self._log("Removed %d event binding(s)." % removed, C_OK)
                 self._refresh_targets()
                 return
-            dests = [(t["widget"], t["dest"]) for t in targets]
+            dests = [(t["widget"], tuple(t.get("hop_names", ())), t["dest"])
+                     for t in targets]
             try:
                 dropped = remove_bindings(self._wbp_path, dests)
             except Exception as exc:
