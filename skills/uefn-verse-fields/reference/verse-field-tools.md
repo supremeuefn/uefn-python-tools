@@ -808,35 +808,101 @@ unreal.BlueprintEditorLibrary.remove_unused_variables(wbp)
 
 ## Renaming a Verse field
 
-A **plain** Verse field can be renamed in place — no delete + recreate — because its public
-name lives in metadata, not in the member's FName. `validate_renames(path, pairs)` is the
-dry-run (name conflicts, event-field refusals); `rename_verse_fields(path, pairs)` mutates.
+> ## ☠ REMOVED (2026-07-29) — there is no rename API
+>
+> `rename_verse_fields`, `validate_renames`, `repair_split_name_fields`,
+> `_retarget_member_varnames` and the GUI Batch Rename panel were **deleted**. Rename a Verse
+> field **in the UEFN editor**, or delete and recreate it.
+>
+> **Two independent reasons, either of which is disqualifying:**
+>
+> 1. **The FName retarget corrupts packages.** `_Package.find_fname` is a *blind byte scan* for
+>    an `(index, number)` pair — it cannot distinguish a real FName field from coincidental
+>    bytes inside an object index or property payload, and `set_fname` overwrites every hit.
+>    Measured on a 30-field rename: `LogLinker: Error: Invalid export object index=434. File is
+>    most likely corrupted` plus a UEFN *"Serialization Error / Corrupt data found"* dialog.
+>    Legitimate hit counts reach **6 per export**, so no threshold separates real from false
+>    hits — this cannot be tuned into safety.
+> 2. **The reload it forces can hard-crash the editor.** Writing the VarName goes through
+>    `_patch_on_disk`, which unloads + GCs + reloads. On a widget that also has event fields the
+>    reload may fail to re-resolve the generated class (`ReloadPackage failed to find a
+>    replacement object for <Class>:VF_SomeEvent`), leaving a stale `REINST_` class that the
+>    next compile dereferences: `Fatal error: BlueprintGeneratedClass.cpp:686
+>    GetAuthoritativeClass: ClassGeneratedBy is null`.
+>
+> **Any future attempt must locate the VarName STRUCTURALLY** — parsed property tags / the
+> `NewVariables` layout — or write it via UAssetAPI, which parses the package properly. Never
+> by byte scan. The rest of this section is kept as the design record for that work.
 
-### Rename a plain field by rewriting ONLY its `DisplayName` value
+The original (broken) premise was that a plain field could be renamed in place because its
+public name lives in metadata, not in the member's FName. That is only half true — and the
+half that is false is what made this unshippable.
+
+### Rename a plain field: rewrite `DisplayName` AND retarget the member `VarName`
+
+A plain field has **two** names and a rename must move both:
+
+| Half | Where it lives | How it moves |
+|---|---|---|
+| Public `Name=` | the `DisplayName` metadata value | rewrite the FString (in memory) |
+| `InternalName=` | the member's `VarName` FName | retarget the name index (on disk) |
 
 The public Verse name of a plain field **is** its `DisplayName` metadata value — the third
 metadata entry patched at create time (see [*Patching Verse Metadata*](#patching-verse-metadata)).
-Rewrite just that FString value and the field is renamed. Everything else on the descriptor
-is left alone.
+Reuse the metadata machinery there: rebuild the descriptor's `MetaDataArray` block with the same
+keys and the new `DisplayName` string, keeping `PropertyFlags` (`65541`) unchanged.
 
-**Verified on disk:** after the rewrite the saved `VerseClassFields` tag reads
-`(Name="<new>",InternalName="<old>",...)` — `Name` flips to the new public name while
-`InternalName` (the member's `VarName`) stays the old name. A `.verse` reference resolves
-against the **public** name (`Name`), so the rename takes effect; the stale `InternalName` is
-**cosmetic only** for plain fields. (MVVM **property** bindings do NOT resolve against the
-public name — they reference the member's *internal* name + GUID, which is unchanged; see
-*No binding repoint*, below.)
+> **A `DisplayName`-only rewrite is a HALF-RENAME and is broken.** It was the behaviour up to
+> 2026-07-29 and is what a user reported: the saved tag reads
+> `(Name="<new>",InternalName="<old>",...)`, the widget displays the new name, and then opening
+> the variable's details panel and clicking accept — **changing nothing** — reverts it. The
+> editor treats `VarName` as the field's identity and re-derives the display name from it.
+> Verse compiles against the new public name but the property behind it is still the old
+> member, so the field drives nothing; assigning it in UMG still works, which hides the cause.
 
-> **The member `VarName` FName at descriptor offset 0 is NEVER patched.** That is the
-> forbidden edit — `memmove`-ing or otherwise rewriting the FName at offset 0 corrupts the
-> engine's name table and crashes on the next compile/save (see
+**Step 2 — retarget the `VarName`.** A `VarName` is an **FName: an index into the package name
+table, not an inline string.** In the `.uasset` the name table is a run of
+`[int32 len][string+NUL][4-byte hash]` entries (verified: `Hidden`, `HorizontalAlignment`,
+`HowToPlayTexture` adjacent). So repointing it is a **size-preserving 8-byte write** per
+reference — none of the nested-container resizing that makes size-*changing* `.uasset` edits
+crash applies. Do it through `_patch_on_disk` (snapshot, patch, backup-on-failure):
+
+```python
+def patch(pkg, _prepared):
+    for new in rename_map.values():   # names FIRST — adding one shifts every offset
+        pkg.add_name(new)
+    holders = {stem, stem + "_C", "Default__" + stem + "_C"}
+    for old, new in rename_map.items():
+        for export in pkg.exports:
+            if not (export["name"] in holders or export["name"].startswith("MVVM")):
+                continue                      # SCOPED — see the warning below
+            for off in pkg.find_fname(export, old):
+                if off == export["entry"] + _EXPORT_NAME_FIELD:
+                    continue                  # never rename the OBJECT itself
+                pkg.set_fname(off, new)
+```
+
+> **⚠ Scope it. Do NOT retarget the name in every export.** A name-table entry is **shared by
+> every object using that name**. If a field shares its name with a **widget** (widgets and
+> field members live in the same generated-class namespace), a blanket retarget also rewrites
+> the widget's references — and MVVM stores binding *destinations* by widget name, so the
+> bindings end up targeting a widget that does not exist:
+> `Could not find the targeted widget: <new>` → **BS_ERROR** (measured 2026-07-29, 4 bindings
+> broken). Touch only the member-holding exports, and never write an export's own name field.
+> `validate_renames` additionally refuses renaming a field onto a widget's name.
+
+**Measured reference shape:** a plain field's name appears as an FName in **1** reference on the
+Blueprint export (its `NewVariables` VarName), **3** on the generated class (the compiled
+property + FieldNotify plumbing), **1** on the CDO, and one per MVVM binding that uses it as a
+**source** — identical to an untouched healthy field. All must move together; retargeting a
+subset leaves the property and its variable disagreeing. Verified: renaming a field bound to 4
+destinations updated all 4 sources and left every widget name untouched, `BS_UP_TO_DATE`.
+
+> **Still forbidden: patching the member `VarName` FName *in memory* at descriptor offset 0.**
+> That corrupts the engine's name table and crashes on the next compile/save (see
 > [*Critical Warnings #1*](#1-never-create-variables-as-real-then-try-to-memory-patch-their-vartype)).
-> A `DisplayName`-only rewrite sidesteps it entirely — the value FString is heap data you own,
-> not an interned name index.
-
-Reuse the metadata machinery from *Patching Verse Metadata*: rebuild the descriptor's
-`MetaDataArray` block with the same keys and the new `DisplayName` string, keeping the field's
-`PropertyFlags` (`65541`) unchanged.
+> The on-disk retarget above is a different operation — the file is patched while the asset is
+> unloaded, then reloaded — and is safe.
 
 ### Event fields are REFUSED for in-place rename
 
@@ -846,23 +912,27 @@ named `<name>` (see [*Verse Event Fields*](#verse-event-fields)). Neither is saf
 from Python, so `validate_renames` flags any event field in the batch and
 `rename_verse_fields` refuses it, telling the user to **delete + recreate** instead.
 
-### No binding repoint is needed (verified)
+### No separate binding repoint is needed (verified)
 
-A plain-field rename touches **no** bindings, because nothing a binding references changes:
+A plain-field rename needs **no extra binding pass** — but for a subtler reason than "nothing
+changes", and the pre-2026-07-29 explanation of this was wrong.
 
 - **Property bindings** reference their source field by the member's **internal name + GUID**
-  (the `SourcePath` `MemberName` is the *internal* name — for a plain field the `VarName`,
-  which the rename leaves untouched — plus a real `MemberGuid`). A DisplayName-only rename does
-  not change either, so the binding keeps resolving. Measured: after renaming `VF_Slot1Name` →
-  `VF_TitleText`, the Slot binding still reads `MemberName="VF_Slot1Name"` and compiles clean.
-  **Do NOT rewrite it to the new public name — there is no member by that name, and the binding
-  would break.**
+  (the `SourcePath` `MemberName` is the *internal* name — for a plain field the `VarName` —
+  plus a real `MemberGuid`). The `VarName` retarget **does** change that name, but it changes it
+  *everywhere the FName appears*, including inside the binding, and the **`MemberGuid` never
+  changes**. So the binding moves with the field in the same pass and keeps resolving.
+  Measured: renaming a bound field left all 13 bindings on the probe widget intact, only the
+  renamed field's `source` updated, compile clean.
 - **Event bindings** reference the field by its **public** name (the `DestinationPath`
   `MemberName`) — so a rename *would* need to repoint them. But only **event** fields are
   event-bound, and event fields are refused for rename (above), so no event binding ever points
   at a renamed (plain) field. Nothing to do.
 
-`rename_verse_fields` therefore rewrites `DisplayName` and nothing else.
+> **Superseded:** earlier revisions said a rename leaves `MemberName` at the old internal name
+> and warned *"Do NOT rewrite it to the new public name."* That described the half-rename bug.
+> Now that the member itself is renamed, a member by the new name **does** exist and the
+> binding correctly points at it. Do not "fix" a binding back to the old name.
 
 ### ⚠ Crash trap — do NOT detach the MetaDataArray before saving
 

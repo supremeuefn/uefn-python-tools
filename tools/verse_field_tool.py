@@ -33,7 +33,7 @@ HARD-WON DETAILS (each cost a crash or a corrupt asset)
 
 import sys
 
-__version__ = "1.3"
+__version__ = "1.3.1"
 
 # Auto-update source. This repo hosts SEVERAL tools, so versioning is PER-TOOL,
 # not repo-wide: each tool keeps its own VERSION.txt + CHANGELOG.md in its own
@@ -1420,6 +1420,10 @@ if _ready:
             return _widget_class_label(native)
         return name
 
+    # An event field's public name <P> is backed by a member named
+    # VerseFieldInternalVariable_<P>; a plain field's member IS its public name.
+    _EVENT_MEMBER_PREFIX = "VerseFieldInternalVariable_"
+
     def variable_guids(wbp_path):
         """Member VarName -> VarGuid, from the asset's own serialization.
 
@@ -1431,6 +1435,66 @@ if _ready:
         text = _export_t3d(wbp)
         return dict(re.findall(
             r'NewVariables\(\d+\)=\(VarName="([^"]+)",VarGuid=([A-F0-9]{32})', text))
+
+    def verse_field_internal_names(wbp_path):
+        """Public Verse name -> the member VarName actually backing it.
+
+        Read from the saved VerseClassFields tag, which carries BOTH halves of a
+        field's identity: `Name=` (the public, Verse-facing name) and
+        `InternalName=` (the blueprint member the property really lives on). They
+        coincide at create time and MUST stay equal -- a field whose two names
+        have diverged is HALF-RENAMED and broken: the widget shows the public
+        name, but the editor treats the member as the field's identity, so the
+        display reverts on the next details-panel accept and Verse compiles
+        against a name backed by nothing. See split_name_fields.
+        """
+        data = _el.find_asset_data(wbp_path)
+        tag = data.get_tag_value("VerseClassFields") or ""
+        return dict(_verse_field_name_pairs(tag))
+
+    def _verse_field_name_pairs(tag):
+        """[(public, internal)] straight from the tag -- duplicates INCLUDED.
+
+        verse_field_internal_names() returns a dict, so two fields sharing a public
+        name collapse into one entry and the widget looks healthy. That is exactly
+        the corrupt state that breaks Verse project-wide, so anything hunting for
+        damage must use this list, not the dict.
+        """
+        return re.findall(r'\(Name="([^"]*)",InternalName="([^"]*)"', tag)
+
+    def duplicate_name_fields(wbp_path):
+        """[(name, count)] for field names defined more than once on the widget.
+
+        Two members under one public name make Verse ambiguous ("could be X or X")
+        and stop the PROJECT'S assets digest from generating -- every widget's Verse
+        surface goes stale, not just this one. Such a widget also resists repair:
+        the duplicate breaks the NewVariables probe, so delete raises. Recovery is
+        to move the .uasset out of Content. Measured 2026-07-29.
+        """
+        data = _el.find_asset_data(wbp_path)
+        tag = data.get_tag_value("VerseClassFields") or ""
+        seen = {}
+        for pub, _intern in _verse_field_name_pairs(tag):
+            seen[pub] = seen.get(pub, 0) + 1
+        return sorted((n, c) for n, c in seen.items() if c > 1)
+
+    def split_name_fields(wbp_path):
+        """[(public_name, internal_name)] for every field whose names disagree.
+
+        Empty on a healthy widget. A non-empty result means some field's public
+        Verse name no longer matches the member backing it: the UMG list shows the
+        public name, but the editor treats the VarName as the truth and will
+        revert the display on the next accept, while Verse compiles against a name
+        that drives nothing. Diagnostic for renames applied by older versions.
+
+        An EVENT field is exempt: its member is legitimately named
+        VerseFieldInternalVariable_<PublicName>, so its two names always differ by
+        construction and that divergence is healthy, not a half-rename.
+        """
+        return [(pub, intern)
+                for pub, intern in verse_field_internal_names(wbp_path).items()
+                if intern and pub != intern
+                and intern != _EVENT_MEMBER_PREFIX + pub]
 
     # ── child sub-widget discovery ───────────────────────────────────────────
     # A parent field can bind a Verse field on an EMBEDDED child instance
@@ -3034,6 +3098,27 @@ if _ready:
         # The unload also flushes, and that write's handle outlives the call.
         _await_unlocked(_wbp_file(wbp_path))
 
+    def _has_live_generated_class(asset):
+        """True when the Blueprint's generated class survived the reload intact.
+
+        A reload that could not re-resolve the class leaves the Blueprint pointing
+        at a transient REINST_ stand-in with a null ClassGeneratedBy. Compiling
+        that is a fatal engine assert (see _reload), so this is checked BEFORE any
+        compile. Two symptoms, either of which condemns it: no generated class at
+        all, or one whose name is the REINST_ placeholder.
+        """
+        try:
+            generated = asset.generated_class()
+        except Exception:
+            return False
+        if generated is None:
+            return False
+        try:
+            name = generated.get_name()
+        except Exception:
+            return False
+        return not name.startswith("REINST_")
+
     def _reload(wbp_path):
         """Force a re-read of the patched file, compile, and save.
 
@@ -3050,6 +3135,31 @@ if _ready:
         asset = _el.load_asset(wbp_path)
         if asset is None:
             raise RuntimeError("the widget did not reload after patching")
+
+        # NEVER compile a blueprint whose reload came back incomplete. When
+        # reload_packages cannot re-resolve the generated class's objects it logs
+        # "ReloadPackage failed to find a replacement object for ..." and drops the
+        # SKEL_ class; the Blueprint is then still pointing at a stale
+        # REINST_<Class> whose ClassGeneratedBy is null, and compiling it is a
+        # HARD CRASH, not an error:
+        #   Fatal error: BlueprintGeneratedClass.cpp:686
+        #   GetAuthoritativeClass: ClassGeneratedBy is null. REINST_<Class>_C_5
+        # Measured 2026-07-29 -- the log shows exactly that reload, a GC, then the
+        # compile, then the fault. Loading again after the GC re-resolves the class
+        # in the normal case; if the skeleton is still missing the asset is left
+        # uncompiled (the patch is already on disk and correct) rather than taking
+        # the editor down.
+        if not _has_live_generated_class(asset):
+            unreal.SystemLibrary.collect_garbage()
+            asset = _el.load_asset(wbp_path)
+            if asset is None or not _has_live_generated_class(asset):
+                _reopen_editor(wbp_path)
+                raise RuntimeError(
+                    "%s reloaded without a usable generated class; the file is "
+                    "patched but was NOT recompiled — reopen the widget in UEFN "
+                    "and compile it there (compiling it from here would crash "
+                    "the editor)" % wbp_path)
+
         _bel.compile_blueprint(asset)
         _save_regenerating_tags(wbp_path)
         _reopen_editor(wbp_path)
@@ -4487,138 +4597,6 @@ if _ready:
 
     _VALID_FIELD_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-    def validate_renames(wbp_path, renames):
-        """Vet a batch of (old, new) renames against the current fields.
-
-        Returns (ok, skipped) where `ok` is [(old, new)] safe to apply and
-        `skipped` is [(old, new, reason)]. A rename is refused when: the new name
-        is empty/invalid, unchanged, the old field is missing, the old field is an
-        EVENT field (not renameable in place -- see below), the new name already
-        exists on the widget, or two renames in the batch collide on the same new
-        name. Pure validation -- touches nothing.
-
-        EVENT fields are refused: a plain field's public name lives only in
-        DisplayName metadata, but an event field's public name ALSO names a real
-        callable UFunction + function graph (`<PublicName>`). A DisplayName-only
-        rewrite flips the VerseClassFields `Name=` tag but leaves that function
-        named the old name, so every event binding then points at a function that
-        no longer exists -- the MVVM panel shows "Invalid Field" (verified). There
-        is no safe Python graph-rename, so the user must delete + recreate instead.
-        """
-        fields = {f["name"]: f for f in list_verse_fields(wbp_path)}
-        existing = set(fields)
-        ok, skipped, produced = [], [], {}
-        # First pass: per-rename legality (independent of the batch).
-        staged = []
-        for old, new in renames:
-            new = (new or "").strip()
-            if old not in fields:
-                skipped.append((old, new, "no such field")); continue
-            if not new:
-                skipped.append((old, new, "empty name")); continue
-            if not _VALID_FIELD_NAME.match(new):
-                skipped.append((old, new, "invalid characters")); continue
-            if new == old:
-                skipped.append((old, new, "unchanged")); continue
-            if fields[old]["type"] == "event":
-                skipped.append((old, new,
-                    "event fields can't be renamed in place — delete and recreate"))
-                continue
-            # A collision with a name that ISN'T itself being renamed away.
-            if new in existing and new not in {o for o, _ in renames}:
-                skipped.append((old, new, "name already exists")); continue
-            produced[new] = produced.get(new, 0) + 1
-            staged.append((old, new))
-        # Second pass: two renames producing the same new name.
-        for old, new in staged:
-            if produced[new] > 1:
-                skipped.append((old, new, "duplicate target name in batch"))
-            else:
-                ok.append((old, new))
-        return ok, skipped
-
-    @_keeps_editor_open
-    def rename_verse_fields(wbp_path, renames):
-        """Rename PLAIN Verse fields (public Verse name only).
-
-        `renames` = [(old_public_name, new_public_name)]. Returns
-        {renamed:[(old,new)], skipped:[(old,new,reason)]}.
-
-        A plain field's PUBLIC Verse name lives in its `DisplayName` metadata, NOT
-        in the member VarName (they merely coincide at create time). So a rename
-        rewrites ONLY that metadata value -- verified: the saved VerseClassFields
-        tag flips `Name=` while `InternalName=` (the VarName) stays put. The member
-        VarName's FName at descriptor offset 0 is NEVER touched (patching it
-        corrupts the FName table and crashes on the next compile).
-
-        Event fields are refused here (their public name is structurally tied to
-        the internal `VerseFieldInternalVariable_<name>` member and a function
-        graph, neither renameable safely) -- validate_renames flags them.
-
-        NO binding repoint is needed. A property binding references its source field
-        by the member's INTERNAL name + GUID (which a DisplayName-only rename leaves
-        untouched), so it keeps resolving. Event bindings reference the field by its
-        PUBLIC name -- but only EVENT fields are event-bound, and those are refused
-        for rename, so no event binding ever points at a renamed (plain) field.
-        """
-        result = {"renamed": [], "skipped": []}
-        if not renames:
-            return result
-
-        ok, skipped = validate_renames(wbp_path, renames)
-        result["skipped"] = skipped
-        if not ok:
-            return result
-        rename_map = dict(ok)                      # old -> new (plain fields only)
-
-        # Rewrite the DisplayName metadata for each renamed field.
-        wbp = _el.load_asset(wbp_path)
-        guids = variable_guids(wbp_path)
-        wbp = _el.load_asset(wbp_path)
-        # A rename does NOT change a field's kind, but the metadata block must be
-        # rebuilt faithfully (message keeps DisableDefaultValue); read the kinds.
-        kinds = {f["name"]: f["type"] for f in list_verse_fields(wbp_path)}
-
-        uobject = ctypes.c_uint64.from_address(id(wbp) + 16).value
-        probe = next(iter(guids))
-        data, count = _find_newvars(uobject, _guid_bytes(guids[probe]), len(guids))
-
-        # old-public -> its VarGuid (plain field: member name == public name).
-        target_guids = {old: _guid_bytes(guids[old]) for old in rename_map
-                        if old in guids}
-        for i in range(count):
-            desc = data + i * _DESC_SIZE
-            guid = bytes((ctypes.c_uint8 * 16).from_address(desc + _GUID_OFFSET))
-            old = next((o for o, g in target_guids.items() if g == guid), None)
-            if old is None:
-                continue
-            new = rename_map[old]
-            block, entries = _build_metadata_block(
-                new, disable_default=(kinds.get(old) == "message"))
-            ctypes.c_uint64.from_address(desc + _METADATA_OFFSET).value = block
-            ctypes.c_uint32.from_address(desc + _METADATA_OFFSET + 8).value = entries
-            ctypes.c_uint32.from_address(desc + _METADATA_OFFSET + 12).value = entries
-
-        # Compile + save. Do NOT detach the metadata arrays first: the engine
-        # serializes each field's metadata FROM the array its descriptor points at,
-        # so an emptied (detached) array written to disk strips the DisplayName we
-        # just wrote -- the field keeps its OLD name (measured). This mirrors CREATE,
-        # which likewise patches metadata and saves WITHOUT detaching; the buffers
-        # stay attached in _KEEP for the session, which is safe on its own. Detach
-        # is only mandatory before an UNLOAD/reload/GC (the crash vice), and this
-        # path does neither -- _save_regenerating_tags compiles and saves in place.
-        _bel.compile_blueprint(wbp)
-        _save_regenerating_tags(wbp_path)
-
-        # Verify via the regenerated tag, not memory: a field that failed to flip
-        # is reported as skipped rather than silently claimed renamed.
-        after = {f["name"] for f in list_verse_fields(wbp_path)}
-        for old, new in ok:
-            if new in after and old not in after:
-                result["renamed"].append((old, new))
-            else:
-                result["skipped"].append((old, new, "did not take on save"))
-        return result
 
     def expand_batch_spec(spec, kind, start, count, param=None):
         """Expand a batch spec into create-field specs.
@@ -5328,22 +5306,13 @@ if _ready:
             self.manage_search.setClearButtonEnabled(True)
             self.manage_search.textChanged.connect(self._refresh_manage)
             gl.addWidget(self.manage_search)
-            # A 4th "New name" column previews proposed renames; it stays blank
-            # unless the rename panel below has something to show. _fill_field_rows
-            # only touches the first 3 columns (it also fills the 3-col Bind-tab
-            # table), so this column is populated separately in _preview_rename.
-            self.tbl_manage = QTableWidget(0, 4)
+            self.tbl_manage = QTableWidget(0, 3)
             self.tbl_manage.setHorizontalHeaderLabels(
-                ["Field", "Type", "Category", "New name"])
+                ["Field", "Type", "Category"])
             self.manage_sort = SortHeader(0, lambda _s: self._refresh_manage())
             self.tbl_manage.setHorizontalHeader(self.manage_sort)
             self._setup_table(self.tbl_manage, multi=True)
-            # Recompute the preview when the selection changes (order matters for
-            # Renumber, and only selected rows are renamed).
-            self.tbl_manage.itemSelectionChanged.connect(self._preview_rename)
             gl.addWidget(self.tbl_manage)
-
-            gl.addWidget(self._build_rename_group())
 
             row = QHBoxLayout()
             row.addWidget(QLabel("Category:"))
@@ -5414,9 +5383,6 @@ if _ready:
                 self.manage_sort.state)
             self._fill_field_rows(self.tbl_manage, self._manage_rows)
             self._fill_category_combo(self.manage_category)
-            # The table was rebuilt (rows reordered/filtered) — repaint the
-            # New-name preview column for whatever is now selected.
-            self._preview_rename()
 
         def _manage_selected(self):
             # Index the SORTED list — table rows map to _manage_rows.
@@ -5467,275 +5433,6 @@ if _ready:
             if r["bindings_dropped"]:
                 self._mlog("Also removed %d binding(s) sourced from deleted "
                            "fields." % r["bindings_dropped"], C_TX2)
-            self._load()
-
-        # ── batch rename ─────────────────────────────────────────────────────
-        # Three ways to derive new names from the selected fields, one active at a
-        # time (like the create-tab patterns). The UI generates the (old, new)
-        # pairs purely in Python; validate_renames / rename_verse_fields do the
-        # safety filtering and the actual patching.
-        _RENAME_MODES = ["Find & Replace", "Prefix / Suffix", "Renumber"]
-
-        def _build_rename_group(self):
-            box = QGroupBox("BATCH RENAME   —   preview updates live for the "
-                            "selected fields (in table order)")
-            bl = QVBoxLayout(box)
-
-            # Segmented mode row — one button stays checked, the others pop out.
-            self._rename_mode_btns = []
-            mrow = QHBoxLayout()
-            mrow.setSpacing(0)
-            for i, label in enumerate(self._RENAME_MODES):
-                btn = QPushButton(label)
-                btn.setObjectName("segment")
-                btn.setCheckable(True)
-                btn.setChecked(i == 0)
-                btn.clicked.connect(lambda _c, idx=i: self._switch_rename_mode(idx))
-                mrow.addWidget(btn)
-                self._rename_mode_btns.append(btn)
-            mrow.addStretch(1)
-            bl.addLayout(mrow)
-
-            # ── Find & Replace controls.
-            self._rn_fr = QWidget()
-            fr = QHBoxLayout(self._rn_fr)
-            fr.setContentsMargins(0, 0, 0, 0)
-            self.rn_find = QLineEdit()
-            self.rn_find.setPlaceholderText("Find")
-            self.rn_replace = QLineEdit()
-            self.rn_replace.setPlaceholderText("Replace with")
-            self.rn_regex = TickBox("Regex")
-            self.rn_first = TickBox("First match only")
-            fr.addWidget(QLabel("Find:"))
-            fr.addWidget(self.rn_find, 1)
-            fr.addWidget(QLabel("Replace with:"))
-            fr.addWidget(self.rn_replace, 1)
-            fr.addWidget(self.rn_regex)
-            fr.addWidget(self.rn_first)
-            bl.addWidget(self._rn_fr)
-
-            # ── Prefix / Suffix controls.
-            self._rn_ps = QWidget()
-            ps = QHBoxLayout(self._rn_ps)
-            ps.setContentsMargins(0, 0, 0, 0)
-            self.rn_prefix = QLineEdit()
-            self.rn_prefix.setPlaceholderText("VF_")
-            self.rn_suffix = QLineEdit()
-            self.rn_suffix.setPlaceholderText("_New")
-            self.rn_repl_vf = TickBox("Replace existing VF_ prefix")
-            ps.addWidget(QLabel("Add prefix:"))
-            ps.addWidget(self.rn_prefix, 1)
-            ps.addWidget(QLabel("Add suffix:"))
-            ps.addWidget(self.rn_suffix, 1)
-            ps.addWidget(self.rn_repl_vf)
-            bl.addWidget(self._rn_ps)
-
-            # ── Renumber controls.
-            self._rn_num = QWidget()
-            nm = QHBoxLayout(self._rn_num)
-            nm.setContentsMargins(0, 0, 0, 0)
-            self.rn_base = QLineEdit()
-            self.rn_base.setPlaceholderText("VF_Slot#   (# = index)")
-            self.rn_start = QSpinBox()
-            self.rn_start.setRange(0, 9999)
-            self.rn_start.setValue(1)
-            self.rn_step = QSpinBox()
-            self.rn_step.setRange(1, 999)
-            self.rn_step.setValue(1)
-            self.rn_pad = QSpinBox()
-            self.rn_pad.setRange(0, 8)
-            self.rn_pad.setValue(0)
-            nm.addWidget(QLabel("Base name:"))
-            nm.addWidget(self.rn_base, 1)
-            nm.addWidget(QLabel("Start:"))
-            nm.addLayout(self._stepper(self.rn_start))
-            nm.addWidget(QLabel("Step:"))
-            nm.addLayout(self._stepper(self.rn_step))
-            nm.addWidget(QLabel("Pad:"))
-            nm.addLayout(self._stepper(self.rn_pad))
-            bl.addWidget(self._rn_num)
-
-            # Any control change re-derives the preview.
-            for w in (self.rn_find, self.rn_replace, self.rn_prefix,
-                      self.rn_suffix, self.rn_base):
-                w.textChanged.connect(self._preview_rename)
-            for t in (self.rn_regex, self.rn_first, self.rn_repl_vf):
-                t.toggled.connect(self._preview_rename)
-            for s in (self.rn_start, self.rn_step, self.rn_pad):
-                s.valueChanged.connect(self._preview_rename)
-
-            # Preview + apply row.
-            arow = QHBoxLayout()
-            arow.addStretch(1)
-            btn_prev = QPushButton("Preview")
-            btn_prev.clicked.connect(self._preview_rename_log)
-            self.btn_rename = QPushButton("Rename Selected")
-            self.btn_rename.setObjectName("btn_action")
-            self.btn_rename.setEnabled(False)
-            self.btn_rename.clicked.connect(self._rename_selected)
-            arow.addWidget(btn_prev)
-            arow.addWidget(self.btn_rename)
-            bl.addLayout(arow)
-
-            self._switch_rename_mode(0)
-            return box
-
-        def _switch_rename_mode(self, idx):
-            """Check the chosen mode button and show only its controls."""
-            for i, btn in enumerate(self._rename_mode_btns):
-                btn.setChecked(i == idx)
-            self._rn_fr.setVisible(idx == 0)
-            self._rn_ps.setVisible(idx == 1)
-            self._rn_num.setVisible(idx == 2)
-            self._preview_rename()
-
-        def _rename_mode(self):
-            for i, btn in enumerate(self._rename_mode_btns):
-                if btn.isChecked():
-                    return i
-            return 0
-
-        def _proposed_new_name(self, old, index):
-            """The new name for `old` (selection position `index`), PURE Python.
-
-            Returns "" when the mode has no input yet, so the preview leaves the
-            row's New-name cell blank rather than flagging it. Malformed regex is
-            caught by the caller and surfaced as a per-row reason.
-            """
-            mode = self._rename_mode()
-            if mode == 0:                              # Find & Replace
-                find = self.rn_find.text()
-                if not find:
-                    return ""
-                repl = self.rn_replace.text()
-                if self.rn_regex.isChecked():
-                    count = 1 if self.rn_first.isChecked() else 0
-                    return re.sub(find, repl, old, count=count)
-                count = 1 if self.rn_first.isChecked() else -1
-                return old.replace(find, repl, count) if count >= 0 \
-                    else old.replace(find, repl)
-            if mode == 1:                              # Prefix / Suffix
-                prefix = self.rn_prefix.text()
-                suffix = self.rn_suffix.text()
-                if not prefix and not suffix:
-                    return ""
-                stem = old
-                # Optionally strip an existing VF_ prefix before adding the new one.
-                if self.rn_repl_vf.isChecked() and stem.startswith("VF_"):
-                    stem = stem[len("VF_"):]
-                return "%s%s%s" % (prefix, stem, suffix)
-            # Renumber
-            base = self.rn_base.text()
-            if not base:
-                return ""
-            n = self.rn_start.value() + index * self.rn_step.value()
-            num = str(n).zfill(self.rn_pad.value())
-            return base.replace("#", num) if "#" in base else base + num
-
-        def _rename_pairs(self):
-            """(old, new) for every selected field whose name the mode changed.
-
-            The second return value is a per-row reason for names the UI itself
-            could not build (bad regex) — kept out of the pair list so
-            validate_renames only ever sees generable names.
-            """
-            names = self._manage_selected()
-            pairs, bad = [], []
-            for i, old in enumerate(names):
-                try:
-                    new = self._proposed_new_name(old, i)
-                except re.error as exc:
-                    bad.append((old, "", "bad regex: %s" % exc))
-                    continue
-                if new and new != old:
-                    pairs.append((old, new))
-            return pairs, bad
-
-        def _preview_rename(self):
-            """Repaint the New-name column and enable/disable Rename.
-
-            Green when a name changes and validate_renames accepts it; red with the
-            skip reason otherwise. Only selected rows carry a preview.
-            """
-            # Clear the New-name column first (unselected/unchanged rows show blank).
-            for r in range(self.tbl_manage.rowCount()):
-                self.tbl_manage.setItem(r, 3, QTableWidgetItem(""))
-            self._rename_ok = []
-            if not self._wbp_path:
-                self.btn_rename.setEnabled(False)
-                return
-            # Map field name -> its current table row for painting.
-            row_of = {row["name"]: r
-                      for r, row in enumerate(self._manage_rows)}
-            pairs, bad = self._rename_pairs()
-            reason_of = {old: reason for old, _new, reason in bad}
-            ok, skipped = ([], [])
-            if pairs:
-                ok, skipped = validate_renames(self._wbp_path, pairs)
-            for old, _new, reason in skipped:
-                reason_of.setdefault(old, reason)
-            ok_new = dict(ok)
-            for old, new in pairs:
-                r = row_of.get(old)
-                if r is None:
-                    continue
-                item = QTableWidgetItem()
-                if old in ok_new:
-                    item.setText(ok_new[old])
-                    item.setForeground(QColor(C_OK))
-                else:
-                    reason = reason_of.get(old, "skipped")
-                    item.setText("%s  (%s)" % (new, reason))
-                    item.setForeground(QColor(C_ERR))
-                self.tbl_manage.setItem(r, 3, item)
-            # Also paint reasons for rows the UI itself rejected (bad regex).
-            for old, _new, reason in bad:
-                r = row_of.get(old)
-                if r is not None:
-                    item = QTableWidgetItem("(%s)" % reason)
-                    item.setForeground(QColor(C_ERR))
-                    self.tbl_manage.setItem(r, 3, item)
-            self._rename_ok = ok
-            self.btn_rename.setEnabled(bool(ok))
-
-        def _preview_rename_log(self):
-            """Preview button: refresh the column and log a one-line summary."""
-            self._preview_rename()
-            if not self._wbp_path:
-                self._mlog("Load a Widget Blueprint first.", C_WARN)
-                return
-            pairs, bad = self._rename_pairs()
-            if not pairs and not bad:
-                self._mlog("Select field(s) and type a rename rule.", C_WARN)
-                return
-            ok, skipped = validate_renames(self._wbp_path, pairs) if pairs else ([], [])
-            for old, new in ok:
-                self._mlog("  %s  →  %s" % (old, new), C_OK)
-            for old, new, reason in skipped + bad:
-                self._mlog("  skipped  %s  (%s)" % (old, reason), C_WARN)
-            self._mlog("%d rename(s) ready, %d skipped."
-                       % (len(ok), len(skipped) + len(bad)),
-                       C_OK if ok else C_WARN)
-
-        def _rename_selected(self):
-            if not self._wbp_path:
-                self._mlog("Load a Widget Blueprint first.", C_WARN)
-                return
-            pairs, _bad = self._rename_pairs()
-            if not pairs:
-                self._mlog("Nothing to rename.", C_WARN)
-                return
-            try:
-                r = rename_verse_fields(self._wbp_path, pairs)
-            except Exception as exc:
-                self._mlog("Rename failed: %s" % exc, C_ERR)
-                return
-            for old, new in r["renamed"]:
-                self._mlog("  %s  →  %s" % (old, new), C_OK)
-            for old, new, reason in r["skipped"]:
-                self._mlog("  skipped  %s  (%s)" % (old, reason), C_WARN)
-            self._mlog("Renamed %d field(s)." % len(r["renamed"]),
-                       C_OK if r["renamed"] else C_WARN)
             self._load()
 
         @staticmethod
@@ -6126,6 +5823,39 @@ if _ready:
                 self._log("No Verse fields on this widget.", C_WARN)
             self._log("Loaded %d Verse field(s), %d engine widget(s), %d sub-widget(s)."
                       % (len(fields), len(widgets), len(children)), C_OK)
+            # Fields an older build renamed only halfway are broken on disk and
+            # look fine in the list, so say so unprompted -- the symptom (the name
+            # reverting when the details panel is accepted) is otherwise baffling.
+            # A duplicated field name is the worst state there is: it stops the
+            # PROJECT'S Verse digest from generating, so every widget goes stale,
+            # and the widget cannot be repaired in place. Say so first and loudest.
+            try:
+                dupes = duplicate_name_fields(path)
+            except Exception:
+                dupes = []
+            if dupes:
+                self._log("%d field name(s) are defined TWICE on this widget. "
+                          "Verse cannot compile the project while this is true — "
+                          "no widget's fields will update. This cannot be fixed "
+                          "from here: restore the widget from a backup, or move it "
+                          "out of Content." % len(dupes), C_ERR)
+                for name, count in dupes:
+                    self._log("  %s  (defined %d times)" % (name, count), C_ERR)
+            try:
+                split = split_name_fields(path)
+            except Exception:
+                split = []
+            if split:
+                self._log("%d field(s) were renamed by an older version of this "
+                          "tool and only half-renamed: the widget shows the new "
+                          "name but the variable behind it is still the old one, "
+                          "so the name reverts when you accept its details panel "
+                          "and Verse code using the new name drives nothing. Fix "
+                          "each one by renaming the variable in the UEFN editor "
+                          "(or delete and recreate the field)." % len(split),
+                          C_WARN)
+                for pub, intern in split:
+                    self._log("  %s  (variable is still %s)" % (pub, intern), C_WARN)
             self._refresh_target_combo()
             self._refresh_bulk_suggestions()
             self._refresh_category_combo()

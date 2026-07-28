@@ -5,6 +5,32 @@ is per-tool: this file and `VERSION.txt` live alongside the tool and track only
 it. The in-tool **Check for updates** button shows this file so you can see what
 a release changes before installing anything.
 
+## v1.3.1
+
+- **Batch rename has been removed.** It never fully worked. A Verse field has two
+  names — the one Verse sees and the variable behind it — and the rename only
+  ever changed the first. That is why a renamed field looked right in the widget
+  but snapped back to its old name the moment you opened its details panel and
+  clicked accept, and why your Verse code compiled against the new name while
+  still driving nothing; you had to keep using the old name to actually change
+  the field.
+
+  Making the variable move too meant editing the widget file directly, and that
+  turned out to be able to corrupt it — a corrupt widget can stop Verse
+  compiling for your entire project, not just that one widget. Since there was
+  no version of this feature that was both correct and safe, it is gone rather
+  than left in place to damage assets. **Rename Verse fields in the UEFN editor
+  instead**, or delete and recreate the field.
+
+- **The tool now warns you about widgets an earlier version already broke.**
+  Loading a widget tells you if any field's name and its variable disagree, and
+  names them, so you can fix them in the editor. It also warns — loudly — if two
+  fields have ended up sharing a name, which stops Verse compiling across the
+  whole project until that widget is restored from a backup.
+
+- Everything else is unchanged: creating, deleting, listing, categorising and
+  binding Verse fields all work exactly as before.
+
 ## v1.3
 
 - **Bind widgets nested deeper than one level**, e.g. `Slot1 > Button > Text`,

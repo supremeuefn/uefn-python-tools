@@ -48,10 +48,10 @@ verse_fields.list_verse_fields(path)         # name / type / ue5_class / categor
 verse_fields.verify_verse_fields(path, names)
 verse_fields.delete_verse_fields(path, names)
 
-# Rename PLAIN fields — DisplayName rewrite only; no binding repoint needed.
-# Event fields are REFUSED (delete + recreate instead). See "Renaming a plain field", below.
-verse_fields.validate_renames(path, [("VF_Old", "VF_New")])   # dry-run: conflicts / event-field refusals
-verse_fields.rename_verse_fields(path, [("VF_Old", "VF_New")])
+# Renaming is NOT supported — the feature was removed (see "Renaming", below).
+# Detection of damage left by the old rename is read-only and still available:
+verse_fields.split_name_fields(path)        # [(public, internal)] where the two names disagree
+verse_fields.duplicate_name_fields(path)    # [(name, count)] — breaks Verse project-wide
 
 # Event bindings (button -> Verse event field) — patched on disk, see the reference
 verse_fields.list_event_widgets(path)        # only widgets whose CDO declares a delegate
@@ -192,33 +192,51 @@ verse_fields.create_conversion_bindings(path, [
 verse_fields.remove_conversion_bindings(path, [("Image2", "Brush")])
 ```
 
-## Renaming a plain field ARE possible (2026-07)
+## Renaming — REMOVED (2026-07-29)
 
-A **plain** Verse field can be renamed in place — no delete/recreate — by rewriting **only
-its `DisplayName` metadata value**. Verified on disk: the saved `VerseClassFields` tag flips
-`Name="<new>"` while `InternalName="<old>"` (the member's `VarName`) stays put. The public
-Verse name (what a `.verse` reference resolves) changes; the member `VarName` FName at
-descriptor offset 0 is **never patched** (that is the forbidden, crash-inducing patch — see
-*Critical Warnings #1*). The stale `InternalName` is cosmetic only for plain fields.
+**There is no rename API.** `rename_verse_fields`, `validate_renames`,
+`repair_split_name_fields` and the GUI's Batch Rename panel were all deleted. To rename a Verse
+field: **rename the variable in the UEFN editor**, or delete and recreate the field.
 
-- **Event fields are REFUSED for in-place rename.** Their public name is structurally tied
-  to the `VerseFieldInternalVariable_<name>` member and a function graph named `<name>`,
-  neither of which is safely renameable — the tool tells the user to delete + recreate.
-- **No binding repoint is needed** (verified). A property binding references its source field
-  by the member's **internal name + GUID**, which a DisplayName-only rename leaves untouched —
-  so it keeps resolving with no change. Event bindings reference the field by its **public**
-  name, but only *event* fields are event-bound and those are refused for rename, so no event
-  binding ever points at a renamed (plain) field. `rename_verse_fields` touches no bindings.
-- **Crash trap — do NOT detach before saving.** The engine serializes each field's metadata
-  *from the array its descriptor points at*, so an emptied (detached) `MetaDataArray` written
-  to disk strips the new `DisplayName` and the field keeps its **old** name (measured). Mirror
-  CREATE: patch metadata, then compile + `_save_regenerating_tags` (never `save_asset`) with
-  the buffer **still attached**; it stays in `_KEEP` for the session. Detach is only for a
-  later unload/reload/GC (the crash vice), which rename does not do. See *Renaming a Verse
-  field* in the reference.
+**Why it was removed.** A Verse field has TWO names that must stay equal:
 
-`validate_renames(path, pairs)` is the dry-run — it reports name conflicts and event-field
-refusals before `rename_verse_fields(path, pairs)` mutates anything.
+| Half | Where it lives |
+|---|---|
+| public `Name=` | the field's `DisplayName` metadata |
+| `InternalName=` | the blueprint member's `VarName` |
+
+The old rename rewrote only the `DisplayName`, producing a **half-rename**: the saved tag reads
+`(Name="<new>",InternalName="<old>",...)`, the widget displays the new name, but the editor
+treats `VarName` as the field's identity — so accepting the variable's details panel *reverts
+the name*, and Verse compiles against the new public name while the property behind it is still
+the old member. That was the user-reported bug.
+
+Moving the second half required retargeting the `VarName` FName in the `.uasset`, and that is
+where it became unfixable-as-designed: `_Package.find_fname` is a **blind byte scan** for an
+`(index, number)` pair. It cannot tell a real FName field from coincidental bytes inside an
+object index or a property payload, and `set_fname` overwrites every hit. Measured on a 30-field
+rename: `LogLinker: Error: Invalid export object index=434. File is most likely corrupted` and a
+UEFN *"Serialization Error / Corrupt data found"* dialog. Legitimate hit counts run to **6 per
+export**, so no threshold separates real hits from false ones — it cannot be made safe by tuning.
+(A rename also forced an unload/reload of the asset, which on event-field widgets could leave a
+stale `REINST_` class and hard-crash the editor: `GetAuthoritativeClass: ClassGeneratedBy is
+null`.) Half-renaming is bad; corrupting a `.uasset` is worse, so the feature is gone.
+
+**If a future implementation is attempted**, the VarName must be located **structurally** —
+parsed property tags / the `NewVariables` layout — or written via UAssetAPI, which parses the
+package instead of pattern-matching bytes. Never by byte scan.
+
+### Detecting damage from the old rename (read-only, still supported)
+
+- `split_name_fields(path)` -> `[(public, internal)]` for fields whose two names disagree. Event
+  fields are exempt: their member is legitimately `VerseFieldInternalVariable_<PublicName>`.
+- `duplicate_name_fields(path)` -> `[(name, count)]`. **☠ Two members under one public name makes
+  Verse ambiguous (`could be X or X`) and stops the PROJECT'S `Assets.digest.verse` from
+  generating — every widget's Verse surface goes stale, not just the broken one.** Such a widget
+  also resists repair (the duplicate breaks the `NewVariables` probe, so delete raises); recovery
+  is to move the `.uasset` out of Content. The GUI reports both states on load.
+- `verse_field_internal_names(path)` returns a **dict**, so duplicates COLLAPSE in it and a
+  corrupt widget looks healthy. Hunt damage with `duplicate_name_fields`, never the dict.
 
 ## What to read before each task
 
@@ -227,7 +245,7 @@ refusals before `rename_verse_fields(path, pairs)` mutates anything.
 | Create variables (any type) | *Creating Variables*, *Type Mapping*, *Patching Verse Metadata* |
 | Create an **event** field | *Verse Event Fields* |
 | Delete variables | *Deleting Variables — Safe Method* |
-| Rename a **plain** field | *Renaming a Verse field* |
+| Rename a field | **Not supported** — rename in the UEFN editor; see *Renaming a Verse field* for why |
 | Read what fields exist | *Reading Verse Fields* |
 | Read or create **property** bindings | *MVVM Bindings* |
 | Create/remove **conversion** bindings (Brush, Visibility) | *Conversion bindings* — note the silent `TargetBrush` trap |
