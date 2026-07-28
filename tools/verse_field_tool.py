@@ -33,7 +33,7 @@ HARD-WON DETAILS (each cost a crash or a corrupt asset)
 
 import sys
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 # Auto-update source. This repo hosts SEVERAL tools, so versioning is PER-TOOL,
 # not repo-wide: each tool keeps its own VERSION.txt + CHANGELOG.md in its own
@@ -3941,7 +3941,7 @@ if _ready:
         return sorted(((p, c) for p, c in groups.items() if c >= 2),
                       key=lambda pc: (-pc[1], pc[0]))
 
-    def _index_by_pattern(items, pattern):
+    def _index_by_pattern(items, pattern, start=None):
         """{n: [items]} where each item's name matches `pattern` with # as the index.
 
         The placeholder may sit anywhere in the name: "VF_Slot#Image" matches
@@ -3949,14 +3949,25 @@ if _ready:
         placeholder is treated as prefix# (number right after it). This handles
         EMBEDDED indices, which trailing-number matching cannot, and
         disambiguates VF_Slot#Image from VF_Slot#Name.
+
+        `start` shifts the keys so two families that count from DIFFERENT bases
+        still line up: with field start 21 and widget start 1,
+        LoadoutButtonHighlight21 and LoadoutSlot_1 both key to 0. Numbers below
+        `start` are dropped — they are outside the family the user asked for.
         """
         pre, post = _split_pattern(pattern) or (pattern, "")
         rx = re.compile("^%s(\\d+)%s$" % (re.escape(pre), re.escape(post)))
         out = {}
         for item in items:
             m = rx.match(item["name"])
-            if m:
-                out.setdefault(int(m.group(1)), []).append(item)
+            if not m:
+                continue
+            n = int(m.group(1))
+            if start is not None:
+                if n < start:
+                    continue
+                n -= start
+            out.setdefault(n, []).append(item)
         return out
 
     def _match_indexed(fields_by_n, targets_by_n, pair_fn, target_noun, field_noun):
@@ -3972,22 +3983,25 @@ if _ready:
                 # "Slot1 · Custom Button / Slot1 · UEFN Button Quiet" -- not the
                 # useless "Slot1 / Slot1" the bare instance names would give. The
                 # per-class Event target resolves it; the message points there.
-                warnings.append("index %d ambiguous: %s / %s"
-                                % (n, [f["name"] for f in fs],
+                warnings.append("ambiguous: %s / %s"
+                                % ([f["name"] for f in fs],
                                    [t.get("display", t["name"]) for t in ts]))
                 continue
             pair = pair_fn(fs[0], ts[0], warnings)
             if pair is not None:
                 pairs.append(pair)
+        # The keys are start-normalised, so printing one would name a number that
+        # appears in NEITHER name -- the item's own name is the useful part.
         for n in sorted(set(fields_by_n) - set(targets_by_n)):
-            warnings.append("%s has no matching %s (index %d)"
-                            % (fields_by_n[n][0]["name"], target_noun, n))
+            warnings.append("%s has no matching %s"
+                            % (fields_by_n[n][0]["name"], target_noun))
         for n in sorted(set(targets_by_n) - set(fields_by_n)):
-            warnings.append("%s has no matching %s (index %d)"
-                            % (targets_by_n[n][0]["name"], field_noun, n))
+            warnings.append("%s has no matching %s"
+                            % (targets_by_n[n][0]["name"], field_noun))
         return pairs, warnings
 
-    def match_by_suffix(fields, widgets, field_pattern, widget_pattern, prop_name):
+    def match_by_suffix(fields, widgets, field_pattern, widget_pattern, prop_name,
+                        field_start=None, widget_start=None):
         """Pair fields with engine widgets by a shared index ("VF_Color#" x
         "Image#"). Returns ([(field, widget, native, prop)], [warnings])."""
         def pair(field, widget, warnings):
@@ -3997,12 +4011,13 @@ if _ready:
                     % (field["name"], field["type"], widget["name"], prop_name))
                 return None
             return (field["name"], widget["name"], widget["native"], prop_name)
-        return _match_indexed(_index_by_pattern(fields, field_pattern),
-                              _index_by_pattern(widgets, widget_pattern),
+        return _match_indexed(_index_by_pattern(fields, field_pattern, field_start),
+                              _index_by_pattern(widgets, widget_pattern, widget_start),
                               pair, "widget", "field")
 
     def match_events_by_suffix(fields, event_widgets, field_pattern, widget_pattern,
-                               delegate_label, button_native=None):
+                               delegate_label, button_native=None,
+                               field_start=None, widget_start=None):
         """Pair EVENT fields with buttons by a shared index ("VF_Click#" x
         "Button#" x "On Clicked"). Returns ([(field, widget, delegate)], [warnings]).
 
@@ -4030,12 +4045,12 @@ if _ready:
             return (field["name"], ref, delegate)
         return _match_indexed(
             _index_by_pattern([f for f in fields if f["type"] == "event"],
-                              field_pattern),
-            _index_by_pattern(widgets, widget_pattern),
+                              field_pattern, field_start),
+            _index_by_pattern(widgets, widget_pattern, widget_start),
             pair, "widget", "event field")
 
     def match_child_by_suffix(fields, child_widgets, field_pattern, child_pattern,
-                              child_field):
+                              child_field, field_start=None, widget_start=None):
         """Pair fields with sub-widget instances by a shared index ("VF_Slot#Image"
         x "Slot#"). Same-type only. Returns ([child-pair dicts], [warnings])."""
         def pair(field, child, warnings):
@@ -4051,8 +4066,9 @@ if _ready:
             return {"mode": "child", "field": field["name"],
                     "widget": child["name"], "class_path": child["class_path"],
                     "child_field": child_field}
-        return _match_indexed(_index_by_pattern(fields, field_pattern),
-                              _index_by_pattern(child_widgets, child_pattern),
+        return _match_indexed(_index_by_pattern(fields, field_pattern, field_start),
+                              _index_by_pattern(child_widgets, child_pattern,
+                                                widget_start),
                               pair, "sub-widget", "field")
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -5198,10 +5214,27 @@ if _ready:
                 self._refresh_target_combo)
             # One merged target dropdown: engine properties + child Verse fields.
             self.target_combo = ArrowCombo()
+            # Each side counts from its own base, so LoadoutButtonHighlight21..28
+            # pairs with LoadoutSlot_1..8. Only the DIFFERENCE matters, but two
+            # boxes read the way the names do -- no mental subtraction.
+            self.field_start = QSpinBox()
+            self.field_start.setRange(0, 9999)
+            self.field_start.setValue(1)
+            self.field_start.setToolTip(
+                "First number of the field family (LoadoutButtonHighlight21 → 21).")
+            self.widget_start = QSpinBox()
+            self.widget_start.setRange(0, 9999)
+            self.widget_start.setValue(1)
+            self.widget_start.setToolTip(
+                "First number of the widget family (LoadoutSlot_1 → 1).")
             row.addWidget(QLabel("Field pattern:"))
             row.addWidget(self.field_pattern, 1)
+            row.addWidget(QLabel("from:"))
+            row.addLayout(self._stepper(self.field_start))
             row.addWidget(QLabel("Widget pattern:"))
             row.addWidget(self.widget_pattern, 1)
+            row.addWidget(QLabel("from:"))
+            row.addLayout(self._stepper(self.widget_start))
             row.addWidget(QLabel("Target:"))
             row.addWidget(self.target_combo, 1)
             bl.addLayout(row)
@@ -5651,24 +5684,38 @@ if _ready:
                      for i in range(self.widget_pattern.count())]
             if not wpats:
                 wpats = [self.widget_pattern.currentText().strip()]
-            best = None   # (pair_count, widget_pattern, target_data)
+            # Try the CURRENT starts first, then each family's own lowest number.
+            # Without the second try a 21-based field family paired against a
+            # 1-based widget family would auto-detect as zero pairs, and the user
+            # would have to set every control by hand.
+            fstart = self._lowest_index(self._fields, fpat)
+            best = None   # (pair_count, widget_pattern, target_data, starts)
             for data in self._all_bulk_targets():
                 for wpat in wpats:
                     if not wpat:
                         continue
-                    pairs, _ = self._match_for_target(data, fpat, wpat)
-                    if pairs and (best is None or len(pairs) > best[0]):
-                        best = (len(pairs), wpat, data)
+                    candidates = [(self.field_start.value(),
+                                   self.widget_start.value())]
+                    wstart = self._lowest_index(self._widgets_for(data), wpat)
+                    if fstart is not None and wstart is not None:
+                        candidates.append((fstart, wstart))
+                    for starts in candidates:
+                        pairs, _ = self._match_for_target(data, fpat, wpat, starts)
+                        if pairs and (best is None or len(pairs) > best[0]):
+                            best = (len(pairs), wpat, data, starts)
             if best:
+                self.field_start.setValue(best[3][0])
+                self.widget_start.setValue(best[3][1])
                 # Widget pattern first: the target list is filtered by it.
                 self.widget_pattern.setCurrentText(best[1])
                 self._refresh_target_combo()
                 index = self.target_combo.findData(best[2])
                 if index >= 0:
                     self.target_combo.setCurrentIndex(index)
-                self._log("Auto-detected: %s  →  %s . %s   (%d pairs — "
-                          "Preview Matches to confirm)"
-                          % (fpat, best[1], self.target_combo.currentText(), best[0]),
+                self._log("Auto-detected: %s from %d  →  %s from %d . %s   "
+                          "(%d pairs — Preview Matches to confirm)"
+                          % (fpat, best[3][0], best[1], best[3][1],
+                             self.target_combo.currentText(), best[0]),
                           C_TX2)
                 return True
             self._refresh_target_combo()
@@ -5677,18 +5724,46 @@ if _ready:
                           "set them manually." % fpat, C_TX2)
             return False
 
-        def _match_for_target(self, data, fpat, wpat):
-            """Dispatch a target tuple to its matcher -> (pairs, warnings)."""
+        @staticmethod
+        def _lowest_index(items, pattern):
+            """Smallest number a family actually uses, or None if it matches nothing.
+
+            This is the natural "start at" for that side: LoadoutSlot_1..8 → 1,
+            LoadoutButtonHighlight21..28 → 21.
+            """
+            keys = _index_by_pattern(items, pattern)
+            return min(keys) if keys else None
+
+        def _widgets_for(self, data):
+            """The widget list a given target draws its right-hand side from."""
+            if data[0] == "child":
+                return self._child_widgets
+            if data[0] == "event":
+                return self._event_widgets
+            return self._widgets
+
+        def _match_for_target(self, data, fpat, wpat, starts=None):
+            """Dispatch a target tuple to its matcher -> (pairs, warnings).
+
+            `starts` is (field_start, widget_start); None means "read the spin
+            boxes" — the auto-pick scan passes explicit values instead.
+            """
+            if starts is None:
+                starts = (self.field_start.value(), self.widget_start.value())
+            fstart, wstart = starts
             if data[0] == "child":
                 return match_child_by_suffix(self._fields, self._child_widgets,
-                                             fpat, wpat, data[1])
+                                             fpat, wpat, data[1],
+                                             field_start=fstart, widget_start=wstart)
             if data[0] == "event":
                 # data = ("event", label) or ("event", label, sub_button_native).
                 native = data[2] if len(data) > 2 else None
                 return match_events_by_suffix(self._fields, self._event_widgets,
                                               fpat, wpat, data[1],
-                                              button_native=native)
-            return match_by_suffix(self._fields, self._widgets, fpat, wpat, data[2])
+                                              button_native=native,
+                                              field_start=fstart, widget_start=wstart)
+            return match_by_suffix(self._fields, self._widgets, fpat, wpat, data[2],
+                                   field_start=fstart, widget_start=wstart)
 
         def _all_bulk_targets(self):
             """Every target this widget could offer, ignoring the current patterns."""

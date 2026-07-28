@@ -5,6 +5,14 @@ is per-tool: this file and `VERSION.txt` live alongside the tool and track only
 it. The in-tool **Check for updates** button shows this file so you can see what
 a release changes before installing anything.
 
+## v1.3.2
+
+- **Bulk bind now works when the two families start at different numbers.** Each
+  pattern has its own **from** box, so `LoadoutButtonHighlight21…28` pairs
+  onto `LoadoutSlot_1…8`. Previously the numbers had to match exactly.
+- Both **from** boxes are filled in automatically; Preview Matches still shows
+  every pair before anything is bound.
+
 ## v1.3.1
 
 - **Batch rename has been removed.** It never fully worked. A Verse field has two
