@@ -442,7 +442,7 @@ class StudioRigState:
 
 @dataclass
 class LightingState:
-    mode: LightingMode = LightingMode.STUDIO
+    mode: LightingMode = LightingMode.WORLD
     preset: str = "neutral"
     preset_name: str = ""
     intensity: float = 1.0
@@ -454,7 +454,7 @@ class LightingState:
             try:
                 self.mode = LightingMode(str(self.mode).lower())
             except ValueError:
-                self.mode = LightingMode.STUDIO
+                self.mode = LightingMode.WORLD
         self.preset = str(self.preset or "neutral").strip().lower()
         custom = self.preset.startswith(CUSTOM_LIGHTING_PRESET_PREFIX)
         if self.preset not in LIGHTING_PRESET_IDS and not custom:
@@ -493,7 +493,7 @@ class LightingState:
         cls,
         data: dict[str, Any] | None,
         *,
-        default_mode: LightingMode = LightingMode.STUDIO,
+        default_mode: LightingMode = LightingMode.WORLD,
     ) -> "LightingState":
         data = dict(data) if isinstance(data, dict) else {}
         return cls(
@@ -546,7 +546,6 @@ class CaptureRequest:
         adjust = dict(data.get("adjust") or {})
         export = dict(data.get("export") or {})
         lighting_data = data.get("lighting")
-        has_lighting = "lighting" in data
         if "outline_color" in adjust:
             adjust["outline_color"] = tuple(adjust["outline_color"])
         if "background_color" in export:
@@ -555,14 +554,7 @@ class CaptureRequest:
             source=CaptureSource.from_dict(data.get("source") or {}),
             camera=CameraState(**camera),
             adjust=AdjustState(**adjust),
-            lighting=LightingState.from_dict(
-                lighting_data,
-                default_mode=(
-                    LightingMode.STUDIO
-                    if has_lighting
-                    else LightingMode.WORLD
-                ),
-            ),
+            lighting=LightingState.from_dict(lighting_data),
             export=ExportOptions(**export),
             preview=bool(data.get("preview", False)),
             preview_fast=bool(data.get("preview_fast", True)),
@@ -1775,7 +1767,7 @@ def save_png(
 # Lighting
 # ============================================================================
 
-BASE_INTENSITY_LUMENS = 6000.0
+BASE_INTENSITY_LUMENS = 187.5
 REFERENCE_RADIUS = 100.0
 STUDIO_HIGHLIGHT_TRIGGER = 250.0
 STUDIO_HIGHLIGHT_TARGET = 245.0
@@ -2422,7 +2414,7 @@ class PreviewScheduler:
 TEMP_Z = -500000.0
 MAX_CAPTURE_SIZE = 4096
 TEMP_PREFIX = "__ThumbnailCreator_"
-STUDIO_EXPOSURE_BIAS = -4.5
+STUDIO_EXPOSURE_BIAS = 0.0
 VISUAL_BOUNDS_PROBE_SIZE = 256
 VISUAL_BOUNDS_MAX_PASSES = 3
 VISUAL_BOUNDS_INITIAL_RADIUS = 100.0
@@ -2758,16 +2750,32 @@ class CaptureSession:
 
     def _source_primitive_components(self):
         components = []
-        seen = set()
-        for actor in self.source_actors:
+        seen_components = set()
+        seen_actors = set()
+        actors = []
+        for source_actor in self.source_actors:
+            candidates = [source_actor]
+            try:
+                candidates.extend(source_actor.get_attached_actors(True, True))
+            except Exception:
+                # Some transient source types do not expose attachment queries.
+                # Their own primitive components remain valid Studio targets.
+                pass
+            for actor in candidates:
+                if actor is None or id(actor) in seen_actors:
+                    continue
+                seen_actors.add(id(actor))
+                actors.append(actor)
+
+        for actor in actors:
             try:
                 actor_components = actor.get_components_by_class(unreal.PrimitiveComponent)
             except Exception:
                 actor_components = []
             for component in actor_components:
-                if component is None or id(component) in seen:
+                if component is None or id(component) in seen_components:
                     continue
-                seen.add(id(component))
+                seen_components.add(id(component))
                 if hasattr(component, "set_lighting_channels"):
                     components.append(component)
         if not components:
@@ -3223,7 +3231,6 @@ class CaptureSession:
                     supersample,
                     capture_size,
                     studio,
-                    image_ops,
                 )
         except CaptureError:
             raise
@@ -3241,7 +3248,6 @@ class CaptureSession:
         supersample,
         capture_size,
         studio,
-        image_ops,
     ):
         self._ensure_capture_actor()
         try:
@@ -4075,7 +4081,9 @@ class GpuPreviewSession:
             settings.set_editor_property(
                 "auto_exposure_method", unreal.AutoExposureMethod.AEM_MANUAL
             )
-            settings.set_editor_property("auto_exposure_bias", 0.0)
+            settings.set_editor_property(
+                "auto_exposure_bias", STUDIO_EXPOSURE_BIAS
+            )
             settings.set_editor_property(
                 "auto_exposure_apply_physical_camera_exposure", False
             )
@@ -5526,9 +5534,21 @@ class ThumbnailCreatorSlateApp:
                         modes, mode_index, key="lighting-mode"
                     )
                     if changed is not None:
-                        self.state.lighting.mode = (
+                        next_mode = (
                             LightingMode.STUDIO if changed == 0 else LightingMode.WORLD
                         )
+                        if (
+                            next_mode == LightingMode.STUDIO
+                            and self.state.lighting.rig is None
+                        ):
+                            self.state.lighting.rig = get_builtin_studio_rig(
+                                self.state.lighting.preset
+                            )
+                        self.state.lighting.mode = next_mode
+                        # A mode transition changes the render/exposure contract.
+                        # Never reuse a highlight calibration measured under the
+                        # previous lighting mode.
+                        self.capture_session._studio_highlight_scale_cache.clear()
                         self._dirty()
                 records = self._lighting_records()
                 preset_ids = [identifier for _label, identifier in records]
@@ -6584,7 +6604,7 @@ class ThumbnailCreatorSlateApp:
                 self._camera_changed()
             elif action == "reset_lighting":
                 self.state.lighting = LightingState(
-                    mode=LightingMode.STUDIO,
+                    mode=LightingMode.WORLD,
                     preset="neutral",
                     rig=get_builtin_studio_rig("neutral"),
                 )

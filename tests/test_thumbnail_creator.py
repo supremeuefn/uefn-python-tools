@@ -34,6 +34,10 @@ AdjustState = tool.AdjustState
 CameraState = tool.CameraState
 CaptureSource = tool.CaptureSource
 ExportOptions = tool.ExportOptions
+LightingMode = tool.LightingMode
+LightingState = tool.LightingState
+get_builtin_studio_rig = tool.get_builtin_studio_rig
+resolve_studio_lights = tool.resolve_studio_lights
 SourceKind = tool.SourceKind
 ThumbnailCreatorState = tool.ThumbnailCreatorState
 ThumbnailCreatorUIState = tool.ThumbnailCreatorUIState
@@ -41,6 +45,124 @@ render_pattern = tool.render_pattern
 
 
 class ThumbnailCreatorStateTests(unittest.TestCase):
+    def test_world_lighting_is_the_default(self):
+        self.assertEqual(ThumbnailCreatorState().lighting.mode, LightingMode.WORLD)
+        self.assertEqual(LightingState.from_dict(None).mode, LightingMode.WORLD)
+        self.assertEqual(
+            LightingState.from_dict({"mode": "unsupported"}).mode,
+            LightingMode.WORLD,
+        )
+
+    def test_studio_light_settings_affect_resolved_lights(self):
+        lighting = LightingState(
+            mode=LightingMode.STUDIO,
+            rig=get_builtin_studio_rig("neutral"),
+        )
+        baseline = resolve_studio_lights(lighting, 100.0)
+
+        lighting.intensity = 2.0
+        brighter = resolve_studio_lights(lighting, 100.0)
+        self.assertEqual(brighter[0].intensity, baseline[0].intensity * 2.0)
+
+        lighting.rig.key.intensity_multiplier = 0.25
+        adjusted_key = resolve_studio_lights(lighting, 100.0)
+        self.assertLess(adjusted_key[0].intensity, brighter[0].intensity)
+        self.assertEqual(adjusted_key[1].intensity, brighter[1].intensity)
+
+    def test_studio_components_include_attached_actor_primitives(self):
+        class FakeComponent:
+            def set_lighting_channels(self, *_channels):
+                pass
+
+        class FakeActor:
+            def __init__(self, components=(), attached=()):
+                self.components = list(components)
+                self.attached = list(attached)
+                self.attachment_query = None
+
+            def get_attached_actors(
+                self,
+                reset_array=True,
+                recursively_include_attached_actors=False,
+            ):
+                self.attachment_query = (
+                    reset_array,
+                    recursively_include_attached_actors,
+                )
+                return list(self.attached)
+
+            def get_components_by_class(self, _component_class):
+                return list(self.components)
+
+        parent_component = FakeComponent()
+        child_component = FakeComponent()
+        child = FakeActor([child_component])
+        parent = FakeActor([parent_component], [child])
+        session = tool.CaptureSession.__new__(tool.CaptureSession)
+        session.source_actors = [parent]
+
+        with mock.patch.object(
+            tool.unreal, "PrimitiveComponent", object(), create=True
+        ):
+            components = session._source_primitive_components()
+
+        self.assertEqual(components, [parent_component, child_component])
+        self.assertEqual(parent.attachment_query, (True, True))
+
+    def test_gpu_preview_uses_export_studio_exposure(self):
+        class FakeSettings:
+            def __init__(self):
+                self.values = {}
+
+            def set_editor_property(self, name, value):
+                self.values[name] = value
+
+        class FakeComponent:
+            def __init__(self):
+                self.settings = FakeSettings()
+                self.values = {}
+
+            def get_editor_property(self, name):
+                if name == "post_process_settings":
+                    return self.settings
+                return self.values[name]
+
+            def set_editor_property(self, name, value):
+                self.values[name] = value
+
+        manual_method = object()
+        component = FakeComponent()
+        exposure_methods = types.SimpleNamespace(AEM_MANUAL=manual_method)
+
+        with mock.patch.object(
+            tool.unreal,
+            "AutoExposureMethod",
+            exposure_methods,
+            create=True,
+        ):
+            tool.GpuPreviewSession._configure_exposure(component, True)
+
+        self.assertIs(
+            component.settings.values["auto_exposure_method"], manual_method
+        )
+        self.assertEqual(
+            component.settings.values["auto_exposure_bias"],
+            tool.STUDIO_EXPOSURE_BIAS,
+        )
+        self.assertFalse(
+            component.settings.values[
+                "auto_exposure_apply_physical_camera_exposure"
+            ]
+        )
+        self.assertTrue(
+            component.settings.values["override_auto_exposure_bias"]
+        )
+        self.assertEqual(component.values["post_process_blend_weight"], 1.0)
+
+    def test_studio_disables_adaptive_exposure(self):
+        self.assertIn("EyeAdaptation", tool.disabled_capture_show_flags(True))
+        self.assertIn("EyeAdaptation", tool.disabled_capture_show_flags(False))
+
     def test_active_state_round_trip(self):
         state = ThumbnailCreatorState(
             source=CaptureSource(
