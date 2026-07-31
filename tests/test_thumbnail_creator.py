@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 TOOL_FILE = REPOSITORY_ROOT / "tools" / "thumbnail_creator_tool.py"
+TOOL_METADATA = REPOSITORY_ROOT / "tools" / "thumbnail_creator"
 
 
 def _load_tool_module():
@@ -125,9 +128,94 @@ class ThumbnailCreatorLayoutTests(unittest.TestCase):
         source = TOOL_FILE.read_text(encoding="utf-8")
 
         self.assertTrue(TOOL_FILE.is_file())
-        self.assertFalse((TOOL_FILE.parent / "thumbnail_creator").exists())
+        self.assertFalse(any(TOOL_METADATA.glob("*.py")))
         self.assertNotIn("from .", source)
         self.assertNotIn("thumbnail_creator.", source)
+
+
+class ThumbnailCreatorReleaseTests(unittest.TestCase):
+    def test_version_metadata_matches_tool(self):
+        source = TOOL_FILE.read_bytes()
+        version = (TOOL_METADATA / "VERSION.txt").read_text(encoding="utf-8").strip()
+
+        self.assertEqual(tool.__version__, version)
+        self.assertEqual(tool._embedded_version(source.decode("utf-8")), version)
+
+    def test_version_parser_is_strict_and_numeric(self):
+        self.assertGreater(tool._version_tuple("1.10.0"), tool._version_tuple("1.9.9"))
+        self.assertEqual(tool._version_tuple("v2.3.4"), (2, 3, 4))
+        with self.assertRaises(ValueError):
+            tool._version_tuple("1.2")
+
+    def test_release_notes_include_only_newer_versions(self):
+        changelog = """# Changelog
+
+## v1.2.0
+- Newest
+
+## v1.1.0
+- Newer
+
+## v1.0.0
+- Current
+"""
+        notes = tool.incoming_release_notes(changelog, current="1.0.0")
+
+        self.assertIn("v1.2.0", notes)
+        self.assertIn("v1.1.0", notes)
+        self.assertNotIn("v1.0.0", notes)
+
+    def test_update_settings_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(tool, "default_saved_directory", return_value=directory):
+                self.assertEqual(tool.load_update_settings(), tool._DEFAULT_UPDATE_SETTINGS)
+                saved = {
+                    "check_updates_on_launch": False,
+                    "auto_install_updates": True,
+                }
+                self.assertTrue(tool.save_update_settings(saved))
+                self.assertEqual(tool.load_update_settings(), saved)
+
+    def test_release_download_urls_are_tag_scoped(self):
+        url = tool._tool_url_for_version("1.2.3")
+
+        self.assertIn("/thumbnail-creator/v1.2.3/", url)
+        self.assertNotIn("/main/", url)
+
+    def test_validated_update_is_atomically_applied(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "thumbnail_creator_tool.py"
+            target.write_text("VALUE = 1\n", encoding="utf-8")
+            payload = b"VALUE = 2\n"
+            update = {
+                "version": "1.0.1",
+                "payload": payload,
+                "code": compile(payload.decode("utf-8"), str(target), "exec"),
+            }
+            with mock.patch.object(tool, "_self_path", return_value=str(target)):
+                with mock.patch.object(tool, "close_window"):
+                    self.assertTrue(tool.apply_validated_update(update))
+
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertFalse(Path(str(target) + ".bak").exists())
+
+    def test_failed_update_restores_previous_script(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "thumbnail_creator_tool.py"
+            previous = b"VALUE = 1\n"
+            target.write_bytes(previous)
+            payload = b"raise RuntimeError('broken release')\n"
+            update = {
+                "version": "1.0.1",
+                "payload": payload,
+                "code": compile(payload.decode("utf-8"), str(target), "exec"),
+            }
+            with mock.patch.object(tool, "_self_path", return_value=str(target)):
+                with mock.patch.object(tool, "close_window"):
+                    with self.assertRaisesRegex(RuntimeError, "previous version was restored"):
+                        tool.apply_validated_update(update)
+
+            self.assertEqual(target.read_bytes(), previous)
 
 
 if __name__ == "__main__":

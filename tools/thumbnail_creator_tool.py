@@ -31,6 +31,196 @@ from typing import Any, Iterable
 import unreal
 
 
+__version__ = "1.0.0"
+
+# Release metadata is intentionally per-tool: updating another script in this
+# repository must never make Thumbnail Creator replace itself.  Release tags are
+# immutable and contain the exact script that the updater consumes.
+_REPO_URL = "https://github.com/supremeuefn/uefn-python-tools"
+_RAW_BASE = "https://raw.githubusercontent.com/supremeuefn/uefn-python-tools"
+_UPDATE_DIR = "tools/thumbnail_creator"
+_VERSION_URL = _RAW_BASE + "/main/" + _UPDATE_DIR + "/VERSION.txt"
+_CHANGELOG_URL = _RAW_BASE + "/main/" + _UPDATE_DIR + "/CHANGELOG.md"
+_TAG_PREFIX = "thumbnail-creator/v"
+_UPDATE_RELOAD_ENV = "THUMBNAIL_CREATOR_UPDATED"
+_UPDATE_SETTINGS_FILE = "update_settings.json"
+_DEFAULT_UPDATE_SETTINGS = {
+    "check_updates_on_launch": True,
+    "auto_install_updates": False,
+}
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    """Parse the strict three-component release format used by this tool."""
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(value or "").strip())
+    if match is None:
+        raise ValueError("Invalid Thumbnail Creator version: %r" % value)
+    return tuple(int(part) for part in match.groups())
+
+
+def _http_get(url: str, timeout: float) -> bytes | None:
+    """Fetch a small release file without making networking a launch gate."""
+    import urllib.request
+
+    separator = "&" if "?" in url else "?"
+    request = urllib.request.Request(
+        url + separator + "cb=" + __version__,
+        headers={
+            "User-Agent": "ThumbnailCreator/" + __version__,
+            "Cache-Control": "no-cache",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except Exception:
+        return None
+
+
+def _tool_url_for_version(version: str) -> str:
+    tag = _TAG_PREFIX + str(version)
+    return _RAW_BASE + "/" + tag + "/tools/thumbnail_creator_tool.py"
+
+
+def check_for_update(*, include_changelog: bool = False) -> dict[str, str] | None:
+    """Return metadata for a newer release, or ``None`` when current/offline."""
+    if os.environ.get(_UPDATE_RELOAD_ENV):
+        return None
+    raw = _http_get(_VERSION_URL, timeout=3.0)
+    if not raw:
+        return None
+    remote = raw.decode("utf-8", "replace").strip().splitlines()[0].strip()
+    try:
+        newer = _version_tuple(remote) > _version_tuple(__version__)
+    except ValueError:
+        return None
+    if not newer:
+        return None
+    changelog = ""
+    if include_changelog:
+        notes = _http_get(_CHANGELOG_URL, timeout=5.0)
+        if notes:
+            changelog = notes.decode("utf-8", "replace").strip()
+    return {
+        "version": remote,
+        "changelog": changelog,
+        "tool_url": _tool_url_for_version(remote),
+    }
+
+
+def incoming_release_notes(changelog: str, current: str = __version__) -> str:
+    """Return only changelog sections newer than ``current`` as plain text."""
+    if not changelog:
+        return "Release notes are unavailable."
+    parts = re.split(r"(?m)^##\s+v([\d.]+).*$", changelog)
+    releases: list[tuple[tuple[int, int, int], str, str]] = []
+    current_tuple = _version_tuple(current)
+    for index in range(1, len(parts), 2):
+        version = parts[index].strip()
+        body = parts[index + 1].strip() if index + 1 < len(parts) else ""
+        try:
+            parsed = _version_tuple(version)
+        except ValueError:
+            continue
+        if parsed > current_tuple:
+            releases.append((parsed, version, body))
+    releases.sort(reverse=True)
+    if not releases:
+        return "Release notes are unavailable."
+    return "\n\n".join("v%s\n%s" % (version, body) for _, version, body in releases)
+
+
+def _embedded_version(source: str) -> str | None:
+    match = re.search(
+        r"(?m)^__version__\s*=\s*['\"]([^'\"]+)['\"]\s*$", source
+    )
+    return match.group(1) if match else None
+
+
+def download_update_payload(version: str) -> dict[str, object]:
+    """Download and validate an immutable tagged release in memory."""
+    _version_tuple(version)
+    payload = _http_get(_tool_url_for_version(version), timeout=30.0)
+    if not payload:
+        raise RuntimeError("The tagged release could not be downloaded.")
+    source = payload.decode("utf-8")
+    if _embedded_version(source) != version:
+        raise RuntimeError("The downloaded script version does not match the release.")
+    path = _self_path()
+    code = compile(source, path, "exec")
+    return {
+        "version": version,
+        "payload": payload,
+        "code": code,
+    }
+
+
+def _self_path() -> str:
+    """Locate this single-file tool even when UEFN omitted ``__file__``."""
+    candidate = globals().get("__file__")
+    if candidate and os.path.isfile(candidate):
+        return os.path.abspath(candidate)
+    code_path = _self_path.__code__.co_filename
+    if code_path and os.path.isfile(code_path):
+        return os.path.abspath(code_path)
+    raise RuntimeError("Thumbnail Creator could not locate its script on disk.")
+
+
+def apply_validated_update(update: dict[str, object]) -> bool:
+    """Atomically install, reload, and roll back a validated release on failure."""
+    path = _self_path()
+    payload = update.get("payload")
+    code = update.get("code")
+    if not isinstance(payload, bytes) or not isinstance(code, types.CodeType):
+        raise ValueError("The update payload was not validated.")
+
+    staged = path + ".new"
+    backup = path + ".bak"
+    with open(staged, "wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    shutil.copy2(path, backup)
+    os.replace(staged, path)
+
+    old_environment = os.environ.get(_UPDATE_RELOAD_ENV)
+    os.environ[_UPDATE_RELOAD_ENV] = "1"
+    try:
+        close_window()
+        exec(code, {"__name__": "__main__", "__file__": path})
+    except Exception as update_error:
+        try:
+            close_window()
+        except Exception:
+            pass
+        os.replace(backup, path)
+        try:
+            with open(path, "rb") as handle:
+                previous_payload = handle.read()
+            previous_code = compile(previous_payload.decode("utf-8"), path, "exec")
+            exec(previous_code, {"__name__": "__main__", "__file__": path})
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "Update failed (%s) and rollback could not relaunch (%s)."
+                % (update_error, rollback_error)
+            ) from update_error
+        raise RuntimeError(
+            "The update failed at startup and the previous version was restored: %s"
+            % update_error
+        ) from update_error
+    else:
+        try:
+            os.remove(backup)
+        except OSError:
+            pass
+        return True
+    finally:
+        if old_environment is None:
+            os.environ.pop(_UPDATE_RELOAD_ENV, None)
+        else:
+            os.environ[_UPDATE_RELOAD_ENV] = old_environment
+
+
 Image = None
 ImageChops = None
 ImageEnhance = None
@@ -418,6 +608,39 @@ def default_saved_directory() -> str:
         return os.path.abspath(os.path.join(os.getcwd(), "Saved", "ThumbnailCreator"))
 
 
+def update_settings_path() -> str:
+    return os.path.join(default_saved_directory(), _UPDATE_SETTINGS_FILE)
+
+
+def load_update_settings() -> dict[str, bool]:
+    settings = dict(_DEFAULT_UPDATE_SETTINGS)
+    try:
+        with open(update_settings_path(), "r", encoding="utf-8") as handle:
+            stored = json.load(handle)
+        if isinstance(stored, dict):
+            for key in _DEFAULT_UPDATE_SETTINGS:
+                if key in stored:
+                    settings[key] = bool(stored[key])
+    except Exception:
+        pass
+    return settings
+
+
+def save_update_settings(settings: dict[str, bool]) -> bool:
+    try:
+        path = update_settings_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            key: bool(settings.get(key, default))
+            for key, default in _DEFAULT_UPDATE_SETTINGS.items()
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        return True
+    except Exception:
+        return False
+
+
 class JsonStore:
     def __init__(
         self,
@@ -729,9 +952,36 @@ def package_directory() -> str:
 def activate_vendor_path() -> str:
     path = package_directory()
     os.makedirs(path, exist_ok=True)
-    if path not in sys.path:
-        site.addsitedir(path)
+    site.addsitedir(path)
+    # The tool-owned environment wins over unrelated packages installed into the
+    # editor globally.  ``addsitedir`` appends, so explicitly move it to the front.
+    normalized = os.path.normcase(os.path.abspath(path))
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if os.path.normcase(os.path.abspath(entry or os.curdir)) != normalized
+    ]
+    sys.path.insert(0, path)
     return path
+
+
+def _clear_runtime_dependency_cache() -> None:
+    for module_name in list(sys.modules):
+        if module_name == "PIL" or module_name.startswith("PIL."):
+            del sys.modules[module_name]
+
+
+def _pillow_version_supported() -> bool:
+    try:
+        pillow = importlib.import_module("PIL")
+        version = tuple(
+            int(match.group(0))
+            for part in str(getattr(pillow, "__version__", "0")).split(".")[:2]
+            if (match := re.match(r"\d+", part)) is not None
+        )
+        return version >= (10, 4) and version < (13, 0)
+    except (ImportError, AttributeError, ValueError):
+        return False
 
 
 def missing_runtime_dependencies(names: list[str] | None = None) -> list[str]:
@@ -747,6 +997,9 @@ def missing_runtime_dependencies(names: list[str] | None = None) -> list[str]:
         try:
             importlib.import_module(module_name)
         except (ImportError, AttributeError):
+            missing.append(display_name)
+            continue
+        if display_name == "Pillow" and not _pillow_version_supported():
             missing.append(display_name)
     return missing
 
@@ -768,7 +1021,33 @@ def _embedded_python() -> str:
     raise RuntimeError("UEFN's bundled python.exe could not be located.")
 
 
-def install_runtime_dependencies(names: list[str] | None = None) -> str:
+def _run_pip(command: list[str], on_line=None) -> int:
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if on_line is None:
+        return subprocess.call(command, creationflags=creationflags)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        creationflags=creationflags,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    if process.stdout is not None:
+        for line in process.stdout:
+            on_line(line.rstrip())
+        process.stdout.close()
+    return process.wait()
+
+
+def install_runtime_dependencies(
+    names: list[str] | None = None,
+    *,
+    on_line=None,
+) -> str:
     """Install missing UI/image dependencies into the tool-owned Saved folder."""
     target = activate_vendor_path()
     python_exe = _embedded_python()
@@ -777,6 +1056,11 @@ def install_runtime_dependencies(names: list[str] | None = None) -> str:
     if unknown:
         raise ValueError("Unknown runtime dependencies: %s" % ", ".join(unknown))
     requirements = [RUNTIME_DEPENDENCIES[name][1] for name in selected]
+    try:
+        _run_pip([python_exe, "-m", "ensurepip"], on_line=on_line)
+    except Exception as exc:
+        if on_line is not None:
+            on_line("ensurepip: %s" % exc)
     command = [
         python_exe,
         "-m",
@@ -787,8 +1071,12 @@ def install_runtime_dependencies(names: list[str] | None = None) -> str:
         "--target",
         target,
     ] + requirements
-    subprocess.check_call(command, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    result = _run_pip(command, on_line=on_line)
+    if result != 0:
+        raise RuntimeError("pip exited with code %d." % result)
     importlib.invalidate_caches()
+    _clear_runtime_dependency_cache()
+    activate_vendor_path()
     remaining = missing_runtime_dependencies(selected)
     if remaining:
         raise RuntimeError(
@@ -4356,6 +4644,17 @@ class ThumbnailCreatorSlateApp:
         self.tick_times: list[float] = []
         self.combo_signatures: dict[str, tuple[object, ...]] = {}
 
+        import queue
+
+        self.update_settings = load_update_settings()
+        self.update_events = queue.Queue()
+        self.update_worker_running = False
+        self.update_available = ""
+        self.update_changelog = ""
+        self.update_status = "v%s" % __version__
+        self.update_payload = None
+        self.update_apply_when_ready = False
+
         self.batch_rows: list[BatchRow] = []
         self.batch_queue: list[int] = []
         self.batch_mode = ""
@@ -4396,6 +4695,11 @@ class ThumbnailCreatorSlateApp:
         }
         self.params = self._create_params()
         self.preview.mark_dirty()
+        if (
+            self.update_settings.get("check_updates_on_launch")
+            and not os.environ.get(_UPDATE_RELOAD_ENV)
+        ):
+            self._start_update_check()
 
     @staticmethod
     def _create_params():
@@ -4481,6 +4785,71 @@ class ThumbnailCreatorSlateApp:
 
     def _log(self, message: str):
         unreal.log("[ThumbnailCreator] %s" % message)
+
+    def _start_update_check(self):
+        if self.update_worker_running:
+            return
+        import threading
+
+        self.update_worker_running = True
+        self.update_status = "Checking for updates..."
+
+        def worker():
+            try:
+                result = check_for_update(include_changelog=True)
+                self.update_events.put(("checked", result))
+            except Exception as exc:
+                self.update_events.put(("error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_update_download(self, *, apply_when_ready: bool):
+        if self.update_worker_running or not self.update_available:
+            return
+        import threading
+
+        version = self.update_available
+        self.update_worker_running = True
+        self.update_apply_when_ready = bool(apply_when_ready)
+        self.update_status = "Downloading and verifying v%s..." % version
+
+        def worker():
+            try:
+                result = download_update_payload(version)
+                self.update_events.put(("downloaded", result))
+            except Exception as exc:
+                self.update_events.put(("error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _pump_update_events(self):
+        import queue
+
+        try:
+            while True:
+                kind, value = self.update_events.get_nowait()
+                self.update_worker_running = False
+                if kind == "checked":
+                    if value is None:
+                        self.update_status = "Up to date (v%s), or offline." % __version__
+                        continue
+                    self.update_available = str(value["version"])
+                    self.update_changelog = incoming_release_notes(
+                        str(value.get("changelog", ""))
+                    )
+                    self.update_status = "Update v%s is available." % self.update_available
+                    if self.update_settings.get("auto_install_updates"):
+                        self._start_update_download(apply_when_ready=True)
+                elif kind == "downloaded":
+                    self.update_payload = value
+                    self.update_status = "v%s verified and ready to install." % value["version"]
+                    if self.update_apply_when_ready:
+                        self._queue("apply_update")
+                elif kind == "error":
+                    self.update_apply_when_ready = False
+                    self.update_status = "Update failed: %s" % value
+        except queue.Empty:
+            pass
 
     def _queue(self, action: str, payload=None):
         if len(self.pending_actions) < 32:
@@ -5017,6 +5386,15 @@ class ThumbnailCreatorSlateApp:
                         self.state.export.supersample,
                     ),
                     "muted",
+                )
+                self._text(
+                    "v%s%s"
+                    % (
+                        __version__,
+                        "  UPDATE" if self.update_available else "",
+                    ),
+                    "success" if self.update_available else "muted",
+                    tooltip=self.update_status,
                 )
                 self._action_button(
                     "Export Thumbnail",
@@ -5952,6 +6330,64 @@ class ThumbnailCreatorSlateApp:
                         self.state.ui.diagnostics_visible = changed
                 finally:
                     self._end_section()
+
+                self._begin_section("Updates")
+                try:
+                    self._text("Thumbnail Creator v%s" % __version__, "accent")
+                    self._text(self.update_status, "warning" if self.update_available else "muted")
+
+                    changed = self._checkbox(
+                        "Check on launch",
+                        self.update_settings.get("check_updates_on_launch", True),
+                        tooltip="Checks version metadata only; it does not download code.",
+                    )
+                    if changed is not None:
+                        self.update_settings["check_updates_on_launch"] = changed
+                        if not changed:
+                            self.update_settings["auto_install_updates"] = False
+                        save_update_settings(self.update_settings)
+
+                    changed = self._checkbox(
+                        "Auto-install verified updates",
+                        self.update_settings.get("auto_install_updates", False),
+                        tooltip=(
+                            "Opt-in. Downloads only tagged releases whose embedded "
+                            "version matches and whose Python code compiles."
+                        ),
+                    )
+                    if changed is not None:
+                        self.update_settings["auto_install_updates"] = changed
+                        if changed:
+                            self.update_settings["check_updates_on_launch"] = True
+                        save_update_settings(self.update_settings)
+
+                    slate.begin_horizontal_stack(False)
+                    try:
+                        self._action_button(
+                            "Check Now",
+                            "check_updates",
+                            enabled=not self.update_worker_running,
+                        )
+                        if self.update_available:
+                            self._action_button(
+                                "Install v%s" % self.update_available,
+                                "install_update",
+                                enabled=not self.update_worker_running,
+                            )
+                        self._action_button("Release Page", "open_release_page")
+                    finally:
+                        slate.end_horizontal_stack()
+
+                    if self.update_available and self.update_changelog:
+                        self._text("What's new", "accent")
+                        note_lines = self.update_changelog.splitlines()
+                        for line in note_lines[:16]:
+                            if line.strip():
+                                self._text(line[:96], "muted")
+                        if len(note_lines) > 16:
+                            self._text("More notes are available on the release page.", "muted")
+                finally:
+                    self._end_section()
             finally:
                 slate.end_vertical_stack()
         finally:
@@ -5959,6 +6395,7 @@ class ThumbnailCreatorSlateApp:
 
     def draw(self, now: float):
         """Draw the stable three-column workspace used by Thumbnail Creator."""
+        self._pump_update_events()
         slate = unreal.SlateIMBlueprintFunctionLibrary
         # ``maximize`` applies to the *next* SlateIM slot.  It must therefore
         # target the root stack as well as the workspace below the toolbar;
@@ -6150,6 +6587,39 @@ class ThumbnailCreatorSlateApp:
             elif action == "batch_select_none":
                 for row in self.batch_rows:
                     row.checked = False
+            elif action == "check_updates":
+                self.update_payload = None
+                self.update_available = ""
+                self.update_changelog = ""
+                self._start_update_check()
+            elif action == "install_update":
+                if not self.update_available:
+                    raise RuntimeError("No update is currently available.")
+                prompt = "Install Thumbnail Creator v%s?\n\n%s" % (
+                    self.update_available,
+                    (self.update_changelog or "Release notes are unavailable.")[:2400],
+                )
+                if self._confirm(prompt):
+                    if self.update_payload is not None:
+                        self._queue("apply_update")
+                    else:
+                        self._start_update_download(apply_when_ready=True)
+            elif action == "apply_update":
+                update = self.update_payload
+                if update is None:
+                    raise RuntimeError("The verified update payload is missing.")
+                self.update_status = "Installing v%s..." % update["version"]
+                apply_validated_update(update)
+            elif action == "open_release_page":
+                import webbrowser
+
+                url = (
+                    "%s/releases/tag/%s%s"
+                    % (_REPO_URL, _TAG_PREFIX, self.update_available)
+                    if self.update_available
+                    else _REPO_URL + "/releases"
+                )
+                webbrowser.open(url)
         except Exception as exc:
             self._log("ERROR: %s" % exc)
             unreal.log_error("[ThumbnailCreator] %s: %s" % (action, exc))
@@ -6471,6 +6941,215 @@ def _message(kind: str, message: str) -> None:
         getattr(unreal, "log_%s" % logger)(message)
 
 
+DEPENDENCY_SETUP_ROOT_ID = "UEFNPythonTools.ThumbnailCreator.Setup"
+_DEPENDENCY_SETUP = None
+
+
+class _DependencySetupController:
+    """Small dependency installer rendered entirely with UEFN's native SlateIM."""
+
+    def __init__(self, required_names: list[str]):
+        import queue
+        import threading
+
+        self.required_names = list(required_names)
+        self.events = queue.Queue()
+        self.logs: list[str] = []
+        self.status = "Preparing the embedded Python environment..."
+        self.running = False
+        self.done = False
+        self.ok = False
+        self.error = ""
+        self.ever_opened = False
+        self.reopen_requested = True
+        self.button_latches: set[str] = set()
+        self.tick_handle = None
+        self._threading = threading
+        self.text_params = unreal.SlateIMTextParams()
+        self.button_params = unreal.SlateIMButtonParams(enabled=True)
+        self.scroll_params = unreal.SlateIMScrollBoxParams()
+        self.progress_params = unreal.SlateIMProgressBarParams()
+        self.start()
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.done = False
+        self.ok = False
+        self.error = ""
+        self.status = "Checking pip..."
+        self.logs.append("=== Thumbnail Creator setup ===")
+
+        def worker():
+            try:
+                target = install_runtime_dependencies(
+                    self.required_names,
+                    on_line=lambda line: self.events.put(("log", line)),
+                )
+                self.events.put(("success", target))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        self._threading.Thread(target=worker, daemon=True).start()
+
+    def pump(self):
+        import queue
+
+        try:
+            while True:
+                kind, value = self.events.get_nowait()
+                if kind == "log":
+                    line = str(value)
+                    self.logs.append(line)
+                    self.logs = self.logs[-120:]
+                    lowered = line.lower()
+                    if "collecting" in lowered or "downloading" in lowered:
+                        self.status = line
+                    elif "installing collected" in lowered:
+                        self.status = "Installing Pillow..."
+                elif kind == "success":
+                    self.running = False
+                    self.done = True
+                    self.ok = True
+                    self.status = "Pillow is ready. Opening Thumbnail Creator..."
+                    self.logs.append("Installed in %s" % value)
+                elif kind == "error":
+                    self.running = False
+                    self.done = True
+                    self.ok = False
+                    self.error = str(value)
+                    self.status = "Setup failed: %s" % value
+        except queue.Empty:
+            pass
+
+    def pressed(self, label: str) -> bool:
+        value = bool(
+            unreal.SlateIMBlueprintFunctionLibrary.button(label, self.button_params)
+        )
+        if value and label not in self.button_latches:
+            self.button_latches.add(label)
+            return True
+        if not value:
+            self.button_latches.discard(label)
+        return False
+
+    def draw(self):
+        slate = unreal.SlateIMBlueprintFunctionLibrary
+        slate.begin_vertical_stack(False)
+        try:
+            slate.text("Preparing Thumbnail Creator", self.text_params)
+            slate.text(self.status, self.text_params)
+            if self.running:
+                slate.progress_bar(
+                    (time.perf_counter() * 0.35) % 1.0,
+                    self.progress_params,
+                )
+            slate.begin_scroll_box(self.scroll_params)
+            try:
+                slate.begin_vertical_stack(False)
+                try:
+                    for line in self.logs[-30:]:
+                        slate.text(line, self.text_params)
+                finally:
+                    slate.end_vertical_stack()
+            finally:
+                slate.end_scroll_box()
+            if self.done and not self.ok:
+                slate.begin_horizontal_stack(False)
+                try:
+                    if self.pressed("Retry"):
+                        self.start()
+                    if self.pressed("Close"):
+                        self.error = "__closed__"
+                finally:
+                    slate.end_horizontal_stack()
+        finally:
+            slate.end_vertical_stack()
+
+
+def _dependency_setup_window_params(controller):
+    size = unreal.Vector2f()
+    size.set_editor_property("x", 720.0)
+    size.set_editor_property("y", 460.0)
+    params = unreal.SlateIMWindowParams(
+        window_title="Thumbnail Creator - Setup",
+        should_reopen=bool(controller.reopen_requested),
+        always_on_top=True,
+    )
+    params.set_editor_property("window_size", size)
+    return params
+
+
+def _stop_dependency_setup(*, open_tool: bool = False):
+    global _DEPENDENCY_SETUP
+    controller = _DEPENDENCY_SETUP
+    _DEPENDENCY_SETUP = None
+    if controller is None:
+        return
+    handle = controller.tick_handle
+    controller.tick_handle = None
+    if handle is not None:
+        try:
+            unreal.unregister_slate_post_tick_callback(handle)
+        except Exception:
+            pass
+    if open_tool:
+        try:
+            _load_pillow_modules()
+            register_tools_menu()
+            open_window()
+        except Exception as exc:
+            _message("critical", "Pillow installed, but startup failed:\n\n%s" % exc)
+
+
+def _dependency_setup_tick(_delta_time: float):
+    controller = _DEPENDENCY_SETUP
+    if controller is None:
+        return
+    controller.pump()
+    slate = unreal.SlateIMBlueprintFunctionLibrary
+    root_attempted = False
+    began = False
+    try:
+        if not slate.can_update_slate_im():
+            return
+        root_attempted = True
+        began = bool(
+            slate.begin_window_root(
+                DEPENDENCY_SETUP_ROOT_ID,
+                _dependency_setup_window_params(controller),
+            )
+        )
+        controller.reopen_requested = False
+        controller.ever_opened = bool(controller.ever_opened or began)
+        if began:
+            controller.draw()
+    finally:
+        if root_attempted:
+            try:
+                slate.end_root()
+            except Exception:
+                pass
+    if controller.ok:
+        _stop_dependency_setup(open_tool=True)
+    elif controller.error == "__closed__" or (
+        controller.ever_opened and not began
+    ):
+        _stop_dependency_setup(open_tool=False)
+
+
+def _start_dependency_setup(required_names: list[str]) -> None:
+    global _DEPENDENCY_SETUP
+    if _DEPENDENCY_SETUP is not None:
+        return
+    controller = _DependencySetupController(required_names)
+    _DEPENDENCY_SETUP = controller
+    controller.tick_handle = unreal.register_slate_post_tick_callback(
+        _dependency_setup_tick
+    )
+
+
 def ensure_runtime_ready(required_names: list[str] | None = None) -> bool:
     if required_names is None:
         missing = missing_runtime_dependencies()
@@ -6484,19 +7163,13 @@ def ensure_runtime_ready(required_names: list[str] | None = None) -> bool:
         "Saved/ThumbnailCreator/python_packages: %s" % ", ".join(missing)
     )
     try:
-        target = install_runtime_dependencies(missing)
+        _start_dependency_setup(missing)
     except Exception as exc:
         _message(
             "critical",
             "Automatic dependency installation failed:\n\n%s" % exc,
         )
         return False
-
-    _message(
-        "information",
-        "Dependencies were installed successfully in:\n%s\n\n"
-        "Restart UEFN once, then launch Thumbnail Creator again." % target,
-    )
     return False
 
 
