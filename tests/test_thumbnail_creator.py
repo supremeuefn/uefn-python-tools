@@ -255,6 +255,92 @@ class ThumbnailCreatorLayoutTests(unittest.TestCase):
         self.assertNotIn("thumbnail_creator.", source)
 
 
+class ThumbnailCreatorPreviewInputTests(unittest.TestCase):
+    def test_drag_stops_when_slate_misses_the_physical_release(self):
+        self.assertTrue(
+            tool.preview_drag_should_stop(
+                released=False,
+                slate_held=True,
+                physical_down=False,
+                app_foreground=True,
+            )
+        )
+
+    def test_drag_stops_when_alt_tab_removes_foreground_ownership(self):
+        self.assertTrue(
+            tool.preview_drag_should_stop(
+                released=False,
+                slate_held=True,
+                physical_down=True,
+                app_foreground=False,
+            )
+        )
+
+    def test_drag_uses_slate_as_fallback_when_physical_state_is_unavailable(self):
+        self.assertFalse(
+            tool.preview_drag_should_stop(
+                released=False,
+                slate_held=True,
+                physical_down=None,
+                app_foreground=None,
+            )
+        )
+        self.assertTrue(
+            tool.preview_drag_should_stop(
+                released=False,
+                slate_held=False,
+                physical_down=None,
+                app_foreground=None,
+            )
+        )
+
+    def test_stale_slate_press_only_produces_one_physical_press_edge(self):
+        pressed, down = tool.preview_button_transition(
+            slate_pressed=False,
+            slate_released=False,
+            slate_held=False,
+            physical_down=True,
+            was_down=False,
+        )
+        self.assertTrue(pressed)
+        self.assertTrue(down)
+
+        repeated, down = tool.preview_button_transition(
+            slate_pressed=True,
+            slate_released=False,
+            slate_held=True,
+            physical_down=True,
+            was_down=down,
+        )
+        self.assertFalse(repeated)
+        self.assertTrue(down)
+
+    def test_physical_release_resets_button_edge_latch(self):
+        pressed, down = tool.preview_button_transition(
+            slate_pressed=True,
+            slate_released=False,
+            slate_held=True,
+            physical_down=False,
+            was_down=True,
+        )
+        self.assertFalse(pressed)
+        self.assertFalse(down)
+
+    def test_discrete_wheel_keys_override_a_missing_analog_axis(self):
+        self.assertEqual(
+            tool.preview_wheel_delta(0.0, scroll_up=True, scroll_down=False),
+            1.0,
+        )
+        self.assertEqual(
+            tool.preview_wheel_delta(0.0, scroll_up=False, scroll_down=True),
+            -1.0,
+        )
+        self.assertEqual(
+            tool.preview_wheel_delta(0.5, scroll_up=False, scroll_down=False),
+            0.5,
+        )
+
+
 class ThumbnailCreatorReleaseTests(unittest.TestCase):
     def test_version_metadata_matches_tool(self):
         source = TOOL_FILE.read_bytes()

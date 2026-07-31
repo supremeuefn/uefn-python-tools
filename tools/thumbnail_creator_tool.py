@@ -2169,6 +2169,111 @@ PREVIEW_BACKGROUNDS = ("Checker", "Dark", "Light", "Solid")
 TARGET_PREVIEW_FPS = 30.0
 PREVIEW_FRAME_INTERVAL = 1.0 / TARGET_PREVIEW_FPS
 PREVIEW_INTERACTION_TAIL = 0.35
+
+_MOUSE_VIRTUAL_KEYS = {
+    "LeftMouseButton": 0x01,
+    "MiddleMouseButton": 0x04,
+}
+_WIN32_INPUT_API = None
+_WIN32_INPUT_API_INITIALIZED = False
+
+
+def _win32_input_api():
+    """Return the small Win32 input surface used for drag fail-safes."""
+    global _WIN32_INPUT_API, _WIN32_INPUT_API_INITIALIZED
+    if _WIN32_INPUT_API_INITIALIZED:
+        return _WIN32_INPUT_API
+    _WIN32_INPUT_API_INITIALIZED = True
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        user32.GetAsyncKeyState.restype = ctypes.c_short
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        _WIN32_INPUT_API = (ctypes, wintypes, user32)
+    except Exception:
+        _WIN32_INPUT_API = None
+    return _WIN32_INPUT_API
+
+
+def physical_mouse_button_down(button_name: str) -> bool | None:
+    """Read the real button state, independent of Slate's event latch."""
+    api = _win32_input_api()
+    virtual_key = _MOUSE_VIRTUAL_KEYS.get(str(button_name))
+    if api is None or virtual_key is None:
+        return None
+    try:
+        return bool(api[2].GetAsyncKeyState(virtual_key) & 0x8000)
+    except Exception:
+        return None
+
+
+def application_is_foreground() -> bool | None:
+    """Return whether the foreground window belongs to this UEFN process."""
+    api = _win32_input_api()
+    if api is None:
+        return None
+    ctypes, wintypes, user32 = api
+    try:
+        window = user32.GetForegroundWindow()
+        if not window:
+            return None
+        process_id = wintypes.DWORD()
+        if not user32.GetWindowThreadProcessId(window, ctypes.byref(process_id)):
+            return None
+        return int(process_id.value) == os.getpid()
+    except Exception:
+        return None
+
+
+def preview_drag_should_stop(
+    *,
+    released: bool,
+    slate_held: bool,
+    physical_down: bool | None,
+    app_foreground: bool | None,
+) -> bool:
+    """Resolve drag lifetime without trusting a possibly-stale Slate latch."""
+    if released or app_foreground is False or physical_down is False:
+        return True
+    return physical_down is None and not slate_held
+
+
+def preview_button_transition(
+    *,
+    slate_pressed: bool,
+    slate_released: bool,
+    slate_held: bool,
+    physical_down: bool | None,
+    was_down: bool,
+) -> tuple[bool, bool]:
+    """Return a one-shot press edge and the next physical button state."""
+    if physical_down is not None:
+        down = bool(physical_down)
+        return bool(down and not was_down), down
+    down = bool(slate_held) and not slate_released
+    return bool(slate_pressed and down and not was_down), down
+
+
+def preview_wheel_delta(
+    analog_value: float,
+    *,
+    scroll_up: bool,
+    scroll_down: bool,
+) -> float:
+    """Prefer Slate's discrete wheel keys when the analog axis is swallowed."""
+    digital_value = float(bool(scroll_up)) - float(bool(scroll_down))
+    return digital_value if digital_value else float(analog_value)
 INSPECTOR_TABS = ("Camera", "Lighting", "Look", "Output")
 
 
@@ -3819,6 +3924,8 @@ class GpuPreviewSession:
             "can_update_slate_im",
             "is_hovered",
             "is_key_held",
+            "is_key_pressed",
+            "is_key_released",
             "get_key_analog_value",
         )
 
@@ -4670,6 +4777,11 @@ class ThumbnailCreatorSlateApp:
         self.last_viewport_signature = ""
         self.last_viewport_poll = 0.0
         self.drag_mode = ""
+        self.preview_input_drawn = False
+        self.preview_button_down = {
+            "LeftMouseButton": False,
+            "MiddleMouseButton": False,
+        }
         self.last_preview_click = 0.0
         self.tick_times: list[float] = []
         self.combo_signatures: dict[str, tuple[object, ...]] = {}
@@ -4714,6 +4826,8 @@ class ThumbnailCreatorSlateApp:
                 "MouseX",
                 "MouseY",
                 "MouseWheelAxis",
+                "MouseScrollUp",
+                "MouseScrollDown",
                 "LeftShift",
                 "RightShift",
                 "LeftControl",
@@ -4882,6 +4996,10 @@ class ThumbnailCreatorSlateApp:
             pass
 
     def _queue(self, action: str, payload=None):
+        if action == "frame_source" and any(
+            queued_action == action for queued_action, _ in self.pending_actions
+        ):
+            return
         if len(self.pending_actions) < 32:
             self.pending_actions.append((action, payload))
 
@@ -5952,25 +6070,51 @@ class ThumbnailCreatorSlateApp:
 
     def _handle_preview_input(self, hovered: bool, now: float):
         slate = unreal.SlateIMBlueprintFunctionLibrary
+        self.preview_input_drawn = True
         left = self.keys["LeftMouseButton"]
         middle = self.keys["MiddleMouseButton"]
-        if hovered and slate.is_key_pressed(left):
+        button_states = {}
+        for button_name, button_key in (
+            ("LeftMouseButton", left),
+            ("MiddleMouseButton", middle),
+        ):
+            pressed, down = preview_button_transition(
+                slate_pressed=bool(slate.is_key_pressed(button_key)),
+                slate_released=bool(slate.is_key_released(button_key)),
+                slate_held=bool(slate.is_key_held(button_key)),
+                physical_down=physical_mouse_button_down(button_name),
+                was_down=bool(self.preview_button_down[button_name]),
+            )
+            self.preview_button_down[button_name] = down
+            button_states[button_name] = (pressed, down)
+
+        if hovered and button_states["LeftMouseButton"][0]:
             shift = slate.is_key_held(self.keys["LeftShift"]) or slate.is_key_held(self.keys["RightShift"])
             self.drag_mode = "roll" if shift else "orbit"
             if now - self.last_preview_click <= 0.30:
                 self._queue("frame_source")
             self.last_preview_click = now
-        elif hovered and slate.is_key_pressed(middle):
+        elif hovered and button_states["MiddleMouseButton"][0]:
             self.drag_mode = "pan"
 
-        # A release can happen after the pointer has left the image, and SlateIM
-        # may then skip the one-frame ``is_key_released`` transition for this
-        # widget.  Derive the drag lifetime from the persistent physical button
-        # state instead, so a missed release event can never leave the camera
-        # attached to the mouse cursor.
+        # SlateIM only tracks events that reach its root. A release over another
+        # widget, outside the window, or during Alt-Tab can therefore leave its
+        # held state latched. Combine the normal Slate transition with Win32's
+        # physical state and foreground ownership so the drag always recovers.
         drag_button = middle if self.drag_mode == "pan" else left
-        if self.drag_mode and not slate.is_key_held(drag_button):
-            self.drag_mode = ""
+        drag_button_name = (
+            "MiddleMouseButton" if self.drag_mode == "pan" else "LeftMouseButton"
+        )
+        if self.drag_mode and (
+            slate.is_key_pressed(self.keys["Escape"])
+            or preview_drag_should_stop(
+                released=bool(slate.is_key_released(drag_button)),
+                slate_held=bool(slate.is_key_held(drag_button)),
+                physical_down=button_states[drag_button_name][1],
+                app_foreground=application_is_foreground(),
+            )
+        ):
+            self._cancel_preview_drag()
         if self.drag_mode:
             dx = float(slate.get_key_analog_value(self.keys["MouseX"]))
             dy = float(slate.get_key_analog_value(self.keys["MouseY"]))
@@ -5986,7 +6130,13 @@ class ThumbnailCreatorSlateApp:
                     camera.roll += dx * 0.35
                 self._camera_changed()
         if hovered:
-            wheel = float(slate.get_key_analog_value(self.keys["MouseWheelAxis"]))
+            wheel = preview_wheel_delta(
+                float(slate.get_key_analog_value(self.keys["MouseWheelAxis"])),
+                scroll_up=bool(slate.is_key_pressed(self.keys["MouseScrollUp"])),
+                scroll_down=bool(
+                    slate.is_key_pressed(self.keys["MouseScrollDown"])
+                ),
+            )
             if abs(wheel) > 1.0e-5:
                 control = slate.is_key_held(self.keys["LeftControl"]) or slate.is_key_held(self.keys["RightControl"])
                 if control:
@@ -6438,6 +6588,7 @@ class ThumbnailCreatorSlateApp:
     def draw(self, now: float):
         """Draw the stable three-column workspace used by Thumbnail Creator."""
         self._pump_update_events()
+        self.preview_input_drawn = False
         slate = unreal.SlateIMBlueprintFunctionLibrary
         # ``maximize`` applies to the *next* SlateIM slot.  It must therefore
         # target the root stack as well as the workspace below the toolbar;
@@ -6465,6 +6616,11 @@ class ThumbnailCreatorSlateApp:
                 slate.end_tab_group()
         finally:
             slate.end_vertical_stack()
+        if self.drag_mode and not self.preview_input_drawn:
+            self._cancel_preview_drag()
+
+    def _cancel_preview_drag(self):
+        self.drag_mode = ""
 
     def _normalize_import_path(self):
         normalized = project_destination_or_default(
@@ -6858,7 +7014,10 @@ def _draw_frame(_delta_time: float):
     if app is None or app.closed:
         return
     slate = unreal.SlateIMBlueprintFunctionLibrary
+    if app.drag_mode and application_is_foreground() is False:
+        app._cancel_preview_drag()
     if not slate.can_update_slate_im():
+        app._cancel_preview_drag()
         return
     now = time.perf_counter()
     app.record_tick(now)
@@ -6873,6 +7032,7 @@ def _draw_frame(_delta_time: float):
         if began:
             app.draw(now)
         elif was_open and _REGISTRY.ever_opened:
+            app._cancel_preview_drag()
             _REGISTRY.cleanup_requested = True
         _REGISTRY.last_error = ""
     except Exception as exc:
