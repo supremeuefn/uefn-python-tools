@@ -166,6 +166,12 @@ def _self_path() -> str:
     raise RuntimeError("Thumbnail Creator could not locate its script on disk.")
 
 
+# UEFN may remove ``__file__`` from the execution namespace as soon as an
+# Execute Python Script command returns.  Keep a stable copy for callbacks,
+# retries, and background work that outlive that initial execution.
+SCRIPT_PATH = _self_path()
+
+
 def apply_validated_update(update: dict[str, object]) -> bool:
     """Atomically install, reload, and roll back a validated release on failure."""
     path = _self_path()
@@ -593,7 +599,7 @@ class LightingPresetError(ValueError):
 
 
 def default_saved_directory() -> str:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_dir = os.path.dirname(SCRIPT_PATH)
     content_dir = os.path.dirname(os.path.dirname(script_dir))
     project_dir = os.path.dirname(content_dir)
     if os.path.basename(content_dir).lower() == "content":
@@ -949,8 +955,10 @@ def package_directory() -> str:
     return os.path.join(default_saved_directory(), "python_packages")
 
 
-def activate_vendor_path() -> str:
-    path = package_directory()
+def activate_vendor_path(path: str | None = None) -> str:
+    if path is None:
+        path = package_directory()
+    path = os.path.abspath(path)
     os.makedirs(path, exist_ok=True)
     site.addsitedir(path)
     # The tool-owned environment wins over unrelated packages installed into the
@@ -984,9 +992,13 @@ def _pillow_version_supported() -> bool:
         return False
 
 
-def missing_runtime_dependencies(names: list[str] | None = None) -> list[str]:
+def missing_runtime_dependencies(
+    names: list[str] | None = None,
+    *,
+    package_path: str | None = None,
+) -> list[str]:
     """Return unavailable dependencies from ``names`` (all when omitted)."""
-    activate_vendor_path()
+    activate_vendor_path(package_path)
     selected = list(names) if names is not None else list(RUNTIME_DEPENDENCIES)
     unknown = [name for name in selected if name not in RUNTIME_DEPENDENCIES]
     if unknown:
@@ -1005,6 +1017,7 @@ def missing_runtime_dependencies(names: list[str] | None = None) -> list[str]:
 
 
 def _embedded_python() -> str:
+    candidate = "<unresolved>"
     try:
         import unreal
 
@@ -1018,7 +1031,10 @@ def _embedded_python() -> str:
         pass
     if os.path.basename(sys.executable).lower().startswith("python"):
         return sys.executable
-    raise RuntimeError("UEFN's bundled python.exe could not be located.")
+    raise RuntimeError(
+        "UEFN's bundled python.exe could not be located. "
+        "Expected: %s (sys.executable: %s)" % (candidate, sys.executable)
+    )
 
 
 def _run_pip(command: list[str], on_line=None) -> int:
@@ -1046,11 +1062,14 @@ def _run_pip(command: list[str], on_line=None) -> int:
 def install_runtime_dependencies(
     names: list[str] | None = None,
     *,
+    python_exe: str | None = None,
+    target: str | None = None,
     on_line=None,
 ) -> str:
     """Install missing UI/image dependencies into the tool-owned Saved folder."""
-    target = activate_vendor_path()
-    python_exe = _embedded_python()
+    target = activate_vendor_path(target)
+    if python_exe is None:
+        python_exe = _embedded_python()
     selected = list(names) if names is not None else list(RUNTIME_DEPENDENCIES)
     unknown = [name for name in selected if name not in RUNTIME_DEPENDENCIES]
     if unknown:
@@ -1076,8 +1095,8 @@ def install_runtime_dependencies(
         raise RuntimeError("pip exited with code %d." % result)
     importlib.invalidate_caches()
     _clear_runtime_dependency_cache()
-    activate_vendor_path()
-    remaining = missing_runtime_dependencies(selected)
+    activate_vendor_path(target)
+    remaining = missing_runtime_dependencies(selected, package_path=target)
     if remaining:
         raise RuntimeError(
             "Dependency installation completed but imports still fail: %s"
@@ -4423,7 +4442,10 @@ class GpuPreviewSession:
 # Slate App
 # ============================================================================
 
-APP_BUILD_TOKEN = (os.path.getsize(__file__), os.stat(__file__).st_mtime_ns)
+APP_BUILD_TOKEN = (
+    os.path.getsize(SCRIPT_PATH),
+    os.stat(SCRIPT_PATH).st_mtime_ns,
+)
 
 TOOL_NAME = "Thumbnail Creator"
 REGISTRY_MODULE_NAME = "_thumbnail_creator_slate_app_v3"
@@ -6922,7 +6944,7 @@ def diagnostics():
 # ============================================================================
 
 
-MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODULE_DIR = os.path.dirname(SCRIPT_PATH)
 FULL_MENU_ENTRY = "UEFNPythonTools.ThumbnailCreator"
 LEGACY_FULL_MENU_ENTRY = "ThumbnailCreator"
 TOOLS_MENU = "LevelEditor.MainMenu.Tools"
@@ -6948,11 +6970,18 @@ _DEPENDENCY_SETUP = None
 class _DependencySetupController:
     """Small dependency installer rendered entirely with UEFN's native SlateIM."""
 
-    def __init__(self, required_names: list[str]):
+    def __init__(
+        self,
+        required_names: list[str],
+        python_exe: str,
+        target: str,
+    ):
         import queue
         import threading
 
         self.required_names = list(required_names)
+        self.python_exe = python_exe
+        self.target = target
         self.events = queue.Queue()
         self.logs: list[str] = []
         self.status = "Preparing the embedded Python environment..."
@@ -6985,6 +7014,8 @@ class _DependencySetupController:
             try:
                 target = install_runtime_dependencies(
                     self.required_names,
+                    python_exe=self.python_exe,
+                    target=self.target,
                     on_line=lambda line: self.events.put(("log", line)),
                 )
                 self.events.put(("success", target))
@@ -7143,7 +7174,11 @@ def _start_dependency_setup(required_names: list[str]) -> None:
     global _DEPENDENCY_SETUP
     if _DEPENDENCY_SETUP is not None:
         return
-    controller = _DependencySetupController(required_names)
+    # Resolve every Unreal-dependent path before starting the worker.  Calls to
+    # unreal.Paths are not safe from the background installation thread.
+    python_exe = _embedded_python()
+    target = activate_vendor_path()
+    controller = _DependencySetupController(required_names, python_exe, target)
     _DEPENDENCY_SETUP = controller
     controller.tick_handle = unreal.register_slate_post_tick_callback(
         _dependency_setup_tick
@@ -7174,8 +7209,7 @@ def ensure_runtime_ready(required_names: list[str] | None = None) -> bool:
 
 
 def _launcher_command() -> str:
-    script_path = os.path.abspath(__file__)
-    return "import runpy; runpy.run_path(%r, run_name='__main__')" % script_path
+    return "import runpy; runpy.run_path(%r, run_name='__main__')" % SCRIPT_PATH
 
 
 def _replace_entry(
@@ -7237,7 +7271,7 @@ def main():
         return None
     _load_pillow_modules()
     register_tools_menu()
-    unreal.log("[ThumbnailCreator] Runtime file: %s" % os.path.abspath(__file__))
+    unreal.log("[ThumbnailCreator] Runtime file: %s" % SCRIPT_PATH)
     return open_window()
 
 
