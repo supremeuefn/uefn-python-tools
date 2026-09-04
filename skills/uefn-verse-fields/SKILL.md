@@ -258,6 +258,13 @@ package instead of pattern-matching bytes. Never by byte scan.
 
 - **Never** create a variable as `real` then memory-patch its `VarType` — corrupts the
   FName, crashes on next compile/save. Build the correct pin type up front with `import_text`.
+- **Never** write a copied export body without checking its FName indices against the
+  DESTINATION name map. Indices are absolute, so a body copied across a changed map resolves
+  to real but WRONG names, desyncs the engine's reader, and crashes it on the next load
+  (`index has value 512, outside of the valid range [0, 417)` → `ACCESS_VIOLATION`). It never
+  fails at write time, and UAssetAPI parses the broken file cleanly. Nested sub-widget events
+  are the ones that hit it. See *A copied export body carries STALE NAME INDICES* in the
+  reference.
 - **Never** hardcode `NEWVARS_OFFSET` or FName key bytes — both are build/session-specific.
   Probe the offset with a known `VarGuid`; derive FName keys with `fname_key16()`.
   (`NEWVARS_OFFSET` has been observed as both 448 and 384 on different builds.)

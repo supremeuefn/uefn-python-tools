@@ -33,7 +33,7 @@ HARD-WON DETAILS (each cost a crash or a corrupt asset)
 
 import sys
 
-__version__ = "1.3.2"
+__version__ = "1.3.3"
 
 # Auto-update source. This repo hosts SEVERAL tools, so versioning is PER-TOOL,
 # not repo-wide: each tool keeps its own VERSION.txt + CHANGELOG.md in its own
@@ -2164,6 +2164,229 @@ if _ready:
 
     _PACKAGE_TAG = 0x9E2A83C1
 
+    # Bit 0 of a property tag's flags byte says an ArrayIndex follows the flags.
+    _TAG_FLAG_HAS_ARRAY_INDEX = 0x1
+
+    # Bytes trailing the property list's terminating "None" in an export body.
+    _BODY_TRAILER = 4
+
+    def _read_type_name(body, pos, pkg, out):
+        """Consume an FPropertyTypeName at `pos`; return the offset just past it.
+
+        UE 5.6 (PROPERTY_TAG_COMPLETE_TYPE_NAME) stores a property's type as a
+        tree, not one FName: ArrayProperty carries its element type,
+        StructProperty its struct type, MapProperty both halves. It is stored
+        flat -- each node is an FName plus an int32 child count, and the list
+        grows as children are read. That count is what makes a tag walkable
+        without a schema, and why a fixed stride desynchronizes on nested paths.
+        """
+        total, seen = 1, 0
+        while seen < total:
+            if pos + 12 > len(body):
+                raise RuntimeError("type name runs past the end of the body")
+            index, _number = struct.unpack_from("<ii", body, pos)
+            if not 0 <= index < len(pkg.names):
+                raise RuntimeError("type name holds FName index %d" % index)
+            out.append(pos)
+            total += struct.unpack_from("<i", body, pos + 8)[0]
+            pos += 12
+            seen += 1
+        return pos
+
+    def _walk_struct_value(body, start, end, pkg, out):
+        """Walk a StructProperty's value if it is a property list; skip it if not.
+
+        Whether a struct serializes as a list or as a native blob (Guid, Vector,
+        Color, ...) is a property of the struct TYPE, which the engine knows from
+        C++ and the tag does not record. Parsing it and keeping the result only
+        when it consumes the value EXACTLY is what keeps this correct without a
+        hardcoded table of struct layouts.
+        """
+        probe = []
+        if _walk_properties(body, start, end, pkg, probe, strict=False) == end:
+            out.extend(probe)
+
+    def _walk_properties(body, pos, end, pkg, out, strict=True):
+        """Walk one property list, recording every FName offset it declares.
+
+        Returns the offset just past the list's terminating "None", or None when
+        the bytes are not a property list and `strict` is False -- which is how
+        an opaque struct payload is told apart from a real list.
+
+        Struct and array values are walked as their own lists rather than
+        skipped, so an FName nested inside SavedPins -> Path -> ContextId is
+        found exactly where the format puts it, never by searching for bytes that
+        look like one.
+        """
+        def fail(message):
+            if strict:
+                raise RuntimeError(message)
+            return None
+
+        while pos + 8 <= end:
+            name_index, _name_number = struct.unpack_from("<ii", body, pos)
+            if not 0 <= name_index < len(pkg.names):
+                return fail("property name index %d does not resolve" % name_index)
+            name = pkg.names[name_index]
+            out.append(pos)
+            pos += 8
+            if name == "None":
+                return pos
+
+            type_start = pos
+            try:
+                pos = _read_type_name(body, pos, pkg, out)
+            except RuntimeError as exc:
+                return fail(str(exc))
+            type_index = struct.unpack_from("<i", body, type_start)[0]
+            type_name = (pkg.names[type_index]
+                         if 0 <= type_index < len(pkg.names) else None)
+            if type_name is None or not type_name.endswith("Property"):
+                return fail("property %r has an unreadable type name" % name)
+
+            if pos + 5 > end:
+                return fail("property %r tag runs past its container" % name)
+            size = struct.unpack_from("<i", body, pos)[0]
+            pos += 4
+            flags = body[pos]
+            pos += 1
+            if flags & _TAG_FLAG_HAS_ARRAY_INDEX:
+                pos += 4
+
+            value_start = pos
+            if size < 0 or value_start + size > end:
+                return fail("property %r declares size %d past its container"
+                            % (name, size))
+            value_end = value_start + size
+
+            if type_name in ("NameProperty", "EnumProperty") and size == 8:
+                # An enum's value is the FName of the literal, so it needs
+                # remapping exactly like a name does.
+                out.append(value_start)
+            elif type_name == "StructProperty":
+                _walk_struct_value(body, value_start, value_end, pkg, out)
+            elif type_name == "ArrayProperty":
+                # Element type is parameter 0 of the tag's type tree; with
+                # complete type names UE writes no per-element header, so a
+                # struct array is a count followed by bare property lists.
+                elem_index = struct.unpack_from("<i", body, type_start + 12)[0]
+                element_type = (pkg.names[elem_index]
+                                if 0 <= elem_index < len(pkg.names) else None)
+                if element_type is None:
+                    return fail("array %r has an unresolvable element type" % name)
+                count = struct.unpack_from("<i", body, value_start)[0]
+                cursor = value_start + 4
+                if element_type == "StructProperty":
+                    for _ in range(count):
+                        nxt = _walk_properties(body, cursor, value_end, pkg,
+                                               out, strict=False)
+                        if nxt is None or nxt <= cursor:
+                            break
+                        cursor = nxt
+                elif element_type == "NameProperty":
+                    for _ in range(count):
+                        if cursor + 8 > value_end:
+                            break
+                        out.append(cursor)
+                        cursor += 8
+            pos = value_end
+        return pos
+
+    def _first_tag_offset(body, pkg, search=64):
+        """Where an export body's property-tag stream starts.
+
+        A body opens with a small object header -- one byte for these MVVM
+        exports -- so the stream is not at offset 0, and its width is not the
+        same for every export class. Probe for the first position that reads as a
+        well-formed tag rather than hardcoding a constant per class.
+        """
+        for pos in range(min(search, max(0, len(body) - 24))):
+            name_index, name_number = struct.unpack_from("<ii", body, pos)
+            type_index, type_number = struct.unpack_from("<ii", body, pos + 8)
+            if name_number or type_number:
+                continue
+            if not (0 <= name_index < len(pkg.names)
+                    and 0 <= type_index < len(pkg.names)):
+                continue
+            if pkg.names[type_index].endswith("Property"):
+                return pos
+        return None
+
+    def _walk_body(body, pkg):
+        """(FName offsets, cursor) for a whole export body.
+
+        The cursor is how far the walk actually got. It is the only sound
+        completeness signal: a desynchronized walk can still stumble past the end
+        of the buffer while silently skipping most of the properties on the way,
+        so "the furthest offset seen" does not prove the body was understood.
+        """
+        start = _first_tag_offset(body, pkg)
+        if start is None:
+            return [], 0
+        out = []
+        consumed = _walk_properties(body, start, len(body), pkg, out)
+        return out, (consumed if consumed is not None else start)
+
+    def _walk_fname_offsets(body, pkg):
+        """Offsets of every FName the property-tag stream declares, in body order."""
+        return _walk_body(body, pkg)[0]
+
+    def _assert_body_copyable(body, pkg, where, baseline=None):
+        """Refuse a copied export body that this package cannot safely take.
+
+        A body stores each FName as a bare index into the name map, so one copied
+        from a package with a different map -- or from this one before the engine
+        rewrote it -- carries indices that mean something else here.
+
+        The failure is silent. A stale index still lands inside the map and
+        resolves to a real but WRONG name, so the engine looks for a struct that
+        is not there, desynchronizes mid-property, and only dies once an index
+        finally lands past the end of the map:
+
+            Serialization error - FName ... index has value 512, outside of the
+            valid range [0, 417)
+
+        which reaches the user as an access violation while OPENING the asset,
+        nowhere near the write that caused it. Checking at the write is what
+        keeps the diagnosis attached to its cause.
+
+        Scoped to the MVVM event exports this tool actually clones. The walker
+        models the property stream, not every export class in a widget -- an
+        animation curve or a settings blob legitimately fails to parse as one, so
+        checking those would refuse healthy bodies rather than catch broken ones.
+        """
+        if not str(where or "").startswith("MVVMBlueprintViewEvent"):
+            return
+        body = bytes(body)
+        try:
+            offsets, consumed = _walk_body(body, pkg)
+        except RuntimeError as exc:
+            raise RuntimeError("body for %s is not a walkable property stream: %s"
+                               % (where, exc))
+        if not offsets or consumed < len(body) - _BODY_TRAILER:
+            raise RuntimeError(
+                "body for %s does not parse as a complete property stream "
+                "(consumed %d of %d bytes)" % (where, consumed, len(body)))
+        for offset in offsets:
+            index, _number = struct.unpack_from("<ii", body, offset)
+            if not 0 <= index < len(pkg.names):
+                raise RuntimeError(
+                    "body for %s holds FName index %d at +%d, outside this "
+                    "package's name map [0, %d)"
+                    % (where, index, offset, len(pkg.names)))
+        if baseline is not None:
+            # A damaged FName inside a nested struct does not derail the outer
+            # walk: the struct stops parsing, its offsets are dropped, and the
+            # cursor still reaches the end. Completeness cannot catch that, but
+            # the count can -- fewer FNames than the body being replaced means a
+            # region stopped parsing.
+            before = len(_walk_fname_offsets(bytes(baseline), pkg))
+            if len(offsets) < before:
+                raise RuntimeError(
+                    "body for %s parses %d FNames where the one it replaces "
+                    "parsed %d -- a region stopped parsing"
+                    % (where, len(offsets), before))
+
     # A NameProperty's tag is fixed-size, so its FName value sits +25 from the
     # tag: [+0 name][+8 "NameProperty"][+16 ArrayIndex][+20 size][+24 flags]
     # [+25 value]. The stream is NOT int32-aligned; values are only reachable
@@ -2794,6 +3017,7 @@ if _ready:
                           if e["name"] == source["name"])
             body = bytes(self.data[source["offset"]:
                                    source["offset"] + source["size"]])
+            _assert_body_copyable(body, self, object_name)
             entry = bytearray(self.data[source["entry"]:
                                         source["entry"] + self.export_entry_size])
             struct.pack_into("<ii", entry, _EXPORT_NAME_FIELD,

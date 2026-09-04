@@ -5,6 +5,13 @@ is per-tool: this file and `VERSION.txt` live alongside the tool and track only
 it. The in-tool **Check for updates** button shows this file so you can see what
 a release changes before installing anything.
 
+## v1.3.3
+
+- **Fixed a crash when binding a button inside a nested widget.** Creating one
+  could write a widget file that UEFN could not open again — it closed the moment
+  you touched the asset. The tool now checks a binding it is about to copy and
+  refuses to write one it cannot read back, so a broken widget is never saved.
+
 ## v1.3.2
 
 - **Bulk bind now works when the two families start at different numbers.** Each

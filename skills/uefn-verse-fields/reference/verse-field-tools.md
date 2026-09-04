@@ -609,6 +609,77 @@ array_size`) before resizing, rather than trusting that the offsets landed right
 >    passed all six cases — including grow *and* shrink — because it never validated container
 >    sizes. It was the writer grading its own homework. **Only the engine is an honest check.**
 
+#### A copied export body carries STALE NAME INDICES (v1.3.3)
+
+**Seeding an event by copying another event's body is only safe while the name map is
+unchanged.** A body stores every FName as a bare int32 index into the package's name map, so
+a body captured under one map and written under another still lands *inside* the map — and
+resolves to a **real but wrong name**.
+
+Observed on a widget whose nested sub-widget binding was seeded from a template
+(`MVVMBlueprintViewEvent_6`, 6 corrupt bytes):
+
+| read as | should have been |
+|---|---|
+| `FieldNotify` (151) | `Id` (175) |
+| `EMVVMBindingMode` (115) | `EMVVMBlueprintPinStatus::Valid` (125) |
+| `EditedObjectPath` (111) | `EMVVMBlueprintFieldPathSource::None` (118) |
+| `/Script/FieldNotification` (5) | `/Script/ModelViewViewModelBlueprint` (8) |
+
+Every wrong value sits a few slots **before** the right one in the map's sorted run, and the
+names in between are exactly the ones the operation itself added. Nothing fails at write time.
+The engine looks for a struct type that is not there, desynchronizes mid-property, keeps
+reading, and only dies when an index finally lands past the end:
+
+```
+LogLinker: Error: [AssetLog] /Project/Path/WBP_Foo: Serialization error - FName are
+serialized as an index recorded in the package header, the current deserialized index
+has value 512, outside of the valid range [0, 417).
+```
+
+which reaches the user as `EXCEPTION_ACCESS_VIOLATION reading 0xa0` **while opening the
+asset** — nowhere near the write that caused it.
+
+**Why the nested case is the one that breaks.** A sub-widget binding's `EventPath` has *two*
+path segments, making its body ~254 bytes longer than a plain one. It is the body that gets
+seeded from a template; the single-segment events on the same widget came through clean.
+
+**Three things that made this hard to see, all worth internalising:**
+
+1. **UAssetAPI parses the corrupt file fine and round-trips it byte-identically.** A clean
+   parse is *not* evidence of health. What localised it was diffing the broken export against
+   a healthy sibling property-by-property — a `RawStructProperty` where the sibling shows a
+   real struct is the desync point.
+2. **`add_name()` only ever APPENDS** (verified: it never re-indexes an existing name), so a
+   same-session copy is safe. The danger is a map the **engine** rewrote on its own save.
+3. **A byte scan cannot police this.** A first attempt at a guard scanned for
+   implausible-looking index pairs and rejected **all seven healthy bodies** — payload bytes
+   routinely look like FNames. The check has to walk the property-tag stream.
+
+**The fix (`_assert_body_copyable`)**: walk the tag stream structurally and refuse a body that
+(a) holds an index outside the map, (b) does not parse to completion, or (c) parses *fewer*
+FNames than the body it replaces — that last one catches damage inside a nested struct, which
+does not derail the outer walk. It is scoped to `MVVMBlueprintViewEvent` exports: the walker
+models the property stream, not every export class, and an animation curve or settings blob
+legitimately fails to parse as one.
+
+**Walking UE 5.6 tags** (`PROPERTY_TAG_COMPLETE_TYPE_NAME`) — the layout that makes any fixed
+stride desynchronize:
+
+```
+[+0 FName name][FPropertyTypeName type][int32 size][byte flags]
+[int32 ArrayIndex, only if flags & 1][value]
+```
+
+`FPropertyTypeName` is a **tree**, not one FName: nodes are `FName + int32 childCount`, stored
+flat, the list growing as children are read. That count is what makes the stream walkable
+without a schema. A body also opens with a small object header (one byte for these exports),
+so the stream does not start at +0 — probe for the first well-formed tag.
+
+Struct values are the remaining subtlety: whether a struct serializes as a property list or as
+a native blob (`Guid`, `Vector`, `Color`) is a property of the struct **type**, which the tag
+does not record. Parse it and keep the result only if it consumes the value *exactly*.
+
 #### How to get this right: use UAssetAPI as an oracle (not as a dependency)
 
 `D:\Dev\uassetgui-uefn` is a real UE serializer (.NET, `dotnet build`). A no-op read+write of
